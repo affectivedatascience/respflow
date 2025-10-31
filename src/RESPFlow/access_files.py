@@ -1,4 +1,4 @@
-import os
+import os, re
 
 #
 # =============================================================================
@@ -22,7 +22,7 @@ def make_paths(root: str | None = None, raw: str | None = None) -> dict[str, str
     If no path is given, will create a `data` folder in the current working
     directory, with these subfolders inside.
     
-    Taken from EMGFlow package by William Conely.
+    Adapted from EMGFlow package by William Conely.
 
     Parameters
     ----------
@@ -64,3 +64,70 @@ def make_paths(root: str | None = None, raw: str | None = None) -> dict[str, str
 #
 # =============================================================================
 #
+
+def map_files(in_path: str, 
+              file_ext: str = 'csv', 
+              expression: str | None = None, 
+              base: str | None = None) -> dict[str, str]:
+    """
+    Generate a dictionary of file names and locations (keys/values) from the
+    subfiles of a folder.
+    
+    Adapted from EMGFlow package by William Conely.
+    
+    Parameters
+    ----------
+    in_path : str
+        The filepath to a directory to read files.
+    file_ext : str, optional
+        The file extension for files to read. Only reads files with this
+        extension. The default is 'csv'.
+    expression : str, optional
+        A regular expression. If provided, will only count files whose relative
+        paths from 'base' match the regular expression. The default is None.
+    base : str, optional
+        The path of the root folder the path keys should start from. Used to
+        track the relative path during recursion. The default is None.
+    
+    Raises
+    ------
+    Exception
+        An exception is raised if 'expression' is not None or a valid regular
+        expression.
+
+    Returns
+    -------
+    file_dirs : dict-str
+        A dictionary of file name keys and file path location values.
+        
+    """
+    
+    # Throw error if Regex does not compile
+    if expression is not None:
+        try:
+            re.compile(expression)
+        except:
+            raise Exception("Invalid regex expression provided")
+    
+    # Set base path and ensure in_path is absolute
+    if base is None:
+        if not os.path.isabs(in_path):
+            in_path = os.path.join(os.getcwd(), in_path)
+        base = in_path
+    
+    # Build file directory dictionary
+    file_dirs = {}
+    for directory in os.listdir(in_path):
+        new_path = os.path.join(in_path, directory)
+        fileName = os.path.relpath(new_path, base)
+        
+        # Recursively check folders
+        if os.path.isdir(new_path):
+            subDir = map_files(new_path, file_ext=file_ext, expression=expression, base=base)
+            file_dirs.update(subDir)
+        
+        # Record the file path (from base to current folder) and absolute path
+        elif (directory.endswith(file_ext)) and ((expression is None) or (re.match(expression, fileName)!=None)):
+            file_dirs[fileName] = new_path
+            
+    return file_dirs

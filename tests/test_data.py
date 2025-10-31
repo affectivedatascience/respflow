@@ -1,10 +1,10 @@
-# ============================================================================
-# Test integrity of data in ../data function
-# ============================================================================
-
 import pytest
 import pandas as pd
 from pathlib import Path
+
+# ============================================================================
+# Test integrity of data in ../data function
+# ============================================================================
 
 DATA_DIR = Path("./src/RESPFlow/data")
 EXPECTED_COLUMNS = {"Time", "Respiration"}
@@ -37,3 +37,7 @@ def test_csv_columns(csv_files):
         "❌ Some files failed column validation:\n"
         + "\n".join(f"{path}: {msg}" for path, msg in bad_files)
     )
+
+# ============================================================================
+# End of tests
+# ============================================================================
