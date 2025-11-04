@@ -76,6 +76,76 @@ def test_make_paths_custom_root_raw(mock_filesystem):
 # Test map_files function
 # ============================================================================
 
+def _touch(p: str, text: str = "") -> None:
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def test_map_files_basic_recursive(tmp_path):
+    # data/
+    #   10/file1.csv
+    #   10/nested/info.txt
+    #   23/file2.csv
+    root = tmp_path / "data"
+    f1 = root / "10" / "file1.csv"
+    f_txt = root / "10" / "nested" / "info.txt"
+    f2 = root / "23" / "file2.csv"
+    _touch(str(f1), "a,b\n1,2\n")
+    _touch(str(f_txt), "hello\n")
+    _touch(str(f2), "x,y\n3,4\n")
+
+    result = map_files(str(root))  # default file_ext='csv'
+    
+    # Only CSVs should appear
+    keys = set(result.keys())
+    assert os.path.join("10", "file1.csv") in keys
+    assert os.path.join("23", "file2.csv") in keys
+    
+    # Non-csv shouldn't be included
+    assert not any("info.txt" in k for k in keys)
+
+    # Values should be absolute paths pointing to the files
+    assert os.path.isabs(result[os.path.join("10", "file1.csv")])
+    assert os.path.exists(result[os.path.join("23", "file2.csv")])
+
+
+def test_map_files_extension_filter(tmp_path):
+    root = tmp_path / "data"
+    _touch(str(root / "a.csv"), "csv\n")
+    _touch(str(root / "b.txt"), "txt\n")
+
+    only_txt = map_files(str(root), file_ext="txt")
+
+    assert set(only_txt.keys()) == {"b.txt"}
+
+    only_csv = map_files(str(root), file_ext="csv")
+    
+    assert set(only_csv.keys()) == {"a.csv"}
+
+
+def test_map_files_regex_filter_on_filename(tmp_path):
+    root = tmp_path / "data"
+    _touch(str(root / "10" / "keep_this.csv"), "ok\n")
+    _touch(str(root / "10" / "skip_this.csv"), "no\n")
+    _touch(str(root / "23" / "also_skip.csv"), "no\n")
+
+    # Match only files whose name ends with 'keep_this.csv'
+    expr = r".*keep_this\.csv$"
+    
+    result = map_files(str(root), expression=expr)
+    
+    keys = set(result.keys())
+    assert any(k.endswith(os.path.join("10", "keep_this.csv")) for k in keys)
+    assert not any(k.endswith("skip_this.csv") for k in keys)
+
+def test_map_files_invalid_regex_raises(tmp_path):
+    root = tmp_path / "data"
+    _touch(str(root / "a.csv"), "a\n")
+
+    with pytest.raises(Exception, match="Invalid regex expression"):
+        map_files(str(root), expression="(")  # invalid regex
+
 # ============================================================================
 # Tests for make_sample_data function
 # ============================================================================
