@@ -1,4 +1,5 @@
 import os, re
+import pandas as pd
 
 #
 # =============================================================================
@@ -131,3 +132,43 @@ def map_files(in_path: str,
             file_dirs[fileName] = new_path
             
     return file_dirs
+
+# 
+# =============================================================================
+# 
+
+from pathlib import Path
+from importlib import resources as ir
+import shutil
+
+def make_sample_data(path_names: dict[str, str]) -> None:
+    """
+    Copies sample data files from the RESPFlow package to the raw data folder
+    specified in `path_names`.
+    
+    Parameters
+    ----------
+    path_names : dict[str, str]
+        A dictionary of file locations with keys for stage in the processing
+        pipeline. Must contain a 'raw' key specifying the destination folder
+        for the sample data.
+    
+    Raises
+    ------
+    ValueError
+        If 'raw' key is not found in `path_names`.
+    
+    Returns
+    -------
+    None
+        The function performs file operations only; it does not return a value.
+    """
+    if "raw" not in path_names:
+        raise ValueError("Raw path not detected in path_names.")
+
+    dest = Path(path_names["raw"])
+    dest.mkdir(parents=True, exist_ok=True)
+
+    with ir.as_file(ir.files("RESPFlow").joinpath("data")) as src:
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+
