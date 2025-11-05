@@ -6,7 +6,7 @@ from pathlib import Path
 # Test integrity of data in ../data function
 # ============================================================================
 
-DATA_DIR = Path("./src/RESPFlow/data")
+DATA_DIR = Path("./src/RespFlow/data")
 EXPECTED_COLUMNS = {"Time", "Respiration"}
 
 @pytest.fixture(scope="module")

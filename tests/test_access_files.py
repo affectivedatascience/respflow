@@ -11,7 +11,7 @@ from importlib import resources as ir
 import pytest
 
 # --- Local application / package imports ---
-from RESPFlow.access_files import make_paths, map_files, make_sample_data
+from RespFlow.access_files import make_paths, map_files, make_sample_data
 
 # ============================================================================
 # Tests
@@ -151,8 +151,8 @@ def test_map_files_invalid_regex_raises(tmp_path):
 # ============================================================================
 
 def _fake_pkg_with_data(tmp_path: Path) -> Path:
-    """Create a fake RESPFlow/data tree with a few files."""
-    root = tmp_path / "RESPFlow_fake"
+    """Create a fake RespFlow/data tree with a few files."""
+    root = tmp_path / "RespFlow_fake"
     (root / "data" / "10").mkdir(parents=True, exist_ok=True)
     (root / "data" / "10" / "file1.csv").write_text("a,b\n1,2\n", encoding="utf-8")
     (root / "data" / "10" / "nested").mkdir(parents=True, exist_ok=True)
@@ -164,7 +164,7 @@ def _fake_pkg_with_data(tmp_path: Path) -> Path:
 
 def test_copies_all_and_preserves_structure(tmp_path: Path, monkeypatch):
     fake_pkg = _fake_pkg_with_data(tmp_path)
-    # Make ir.files("RESPFlow") point to our fake package root
+    # Make ir.files("RespFlow") point to our fake package root
     monkeypatch.setattr(ir, "files", lambda _pkg: fake_pkg)
 
     dest = tmp_path / "raw"

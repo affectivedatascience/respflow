@@ -3,7 +3,7 @@ requires = ["flit_core >=3.11,<4"]
 build-backend = "flit_core.buildapi"
 
 [project]
-name = "RESPFlow"
+name = "RespFlow"
 authors = [{name = "David Garcia", email = "garciadavid2003@gmail.com"}]
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -11,4 +11,4 @@ license-files = ["LICENSE"]
 dynamic = ["version", "description"]
 
 [project.urls]
-Home = "https://github.com/garciadavid2000/RESPFlow-Python-Package"
+Home = "https://github.com/garciadavid2000/RespFlow-Python-Package"

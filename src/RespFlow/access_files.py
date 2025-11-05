@@ -143,7 +143,7 @@ import shutil
 
 def make_sample_data(path_names: dict[str, str]) -> None:
     """
-    Copies sample data files from the RESPFlow package to the raw data folder
+    Copies sample data files from the RespFlow package to the raw data folder
     specified in `path_names`.
     
     Parameters
@@ -169,6 +169,6 @@ def make_sample_data(path_names: dict[str, str]) -> None:
     dest = Path(path_names["raw"])
     dest.mkdir(parents=True, exist_ok=True)
 
-    with ir.as_file(ir.files("RESPFlow").joinpath("data")) as src:
+    with ir.as_file(ir.files("RespFlow").joinpath("data")) as src:
         shutil.copytree(src, dest, dirs_exist_ok=True)
 
