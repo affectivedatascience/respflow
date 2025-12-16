@@ -11,3 +11,4 @@ six==1.17.0
 tzdata==2025.2
 plotly
 dash
+dash_ag_grid
