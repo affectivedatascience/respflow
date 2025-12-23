@@ -26,8 +26,11 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
     app = Dash()
 
     app.layout = html.Div([
+        # Title
         html.Div(children='RespFlow Breathing Signal Dashboard', style={'textAlign': 'center', 'fontSize': 24}),
+        # Just a line to split the title from the rest of the content
         html.Hr(),
+        # Dropdown for selecting the file
         html.Div([
             html.Label('File:', style={'fontWeight': 'bold', 'marginRight': '10px'}),
             dcc.Dropdown(
@@ -39,6 +42,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
                 style={'width': '400px'}
             )
         ], style={'marginBottom': '20px'}),
+        # Checklist for selecting which stages to display
         html.Div([
             html.Label('Signal Displayed:', style={'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block'}),
             dcc.Checklist(
@@ -52,6 +56,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
                 style={'columnCount': 2}
             )
         ], style={'marginBottom': '20px'}),
+        # Graph for displaying the breathing signals
         dcc.Graph(figure={}, id='breathing_chart')
     ])
 
