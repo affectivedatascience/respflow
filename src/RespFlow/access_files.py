@@ -46,7 +46,7 @@ def make_paths(root: str | None = None, raw: str | None = None) -> dict[str, str
     # Create dictionary
     path_names = {
         'raw':raw,
-        'notch':os.path.join(root, '2_notch'),
+        'detrend':os.path.join(root, '2_detrend'),
         'bandpass':os.path.join(root, '3_bandpass'),
         'fwr':os.path.join(root, '4_fwr'),
         'screened':os.path.join(root, '5_screened'),
