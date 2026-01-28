@@ -82,12 +82,12 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate, window_size_seco
 # =============================================================================
 #
 
-def apply_bandpass(data, fs, lowcut=0.05, highcut=2.0, order=2):
+def apply_bandpass(data, sampling_rate, lowcut=0.05, highcut=2.0, order=2):
     """
     Applies a zero-phase Butterworth bandpass filter.
     Standard: 0.05-2.0 Hz for RIP belt data.
     """
-    nyquist = 0.5 * fs
+    nyquist = 0.5 * sampling_rate
     low = lowcut / nyquist
     high = highcut / nyquist
 
