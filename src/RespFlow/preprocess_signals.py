@@ -17,20 +17,19 @@ A collection of functions for preprocessing signals.
 # =============================================================================
 #
 
-def apply_detrend(signal, sampling_rate, window_size_seconds=60):
-    # IMPORTANT: 
-    # 60-second window
+def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds: int = 60) -> tuple:
+    # 60-second window default based on BreathMetrics paper
     window_size = int(window_size_seconds * sampling_rate)
-    
+
     # Calculate rolling median
     baseline = median_filter(signal, size=window_size)
-    
+
     # Detrend
     detrended_signal = signal - baseline
-    
+
     return detrended_signal, baseline
 
-def detrend_signals(in_path: str, out_path: str, sampling_rate, window_size_seconds=60):
+def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size_seconds: int = 60) -> None:
     """
     Applies detrending to all columns except 'time' in all CSV files.
     Preserves the folder structure from in_path to out_path.
@@ -82,7 +81,7 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate, window_size_seco
 # =============================================================================
 #
 
-def apply_bandpass(data, sampling_rate, lowcut=0.05, highcut=2.0, order=2):
+def apply_bandpass(data: list | tuple, sampling_rate: int, lowcut: float = 0.05, highcut: float = 2.0, order: int = 2) -> list | tuple:
     """
     Applies a zero-phase Butterworth bandpass filter.
     Standard: 0.05-2.0 Hz for RIP belt data.
@@ -103,7 +102,7 @@ def apply_bandpass(data, sampling_rate, lowcut=0.05, highcut=2.0, order=2):
 
 # Strictly needs path_names (raw files), and sampling rate
 # optional is upper and lower frequency for bandpass filter
-def bandpass_filter_signals(in_path: str, out_path: str, sampling_rate, lowcut=0.05, highcut=2.0, order=2):
+def bandpass_filter_signals(in_path: str, out_path: str, sampling_rate: int, passband: str | tuple = 'default', order: int = 2) -> None:
     """
     Applies a Butterworth bandpass filter to all columns except 'time' in all CSV files.
     Preserves the folder structure from in_path to out_path.
@@ -116,10 +115,11 @@ def bandpass_filter_signals(in_path: str, out_path: str, sampling_rate, lowcut=0
         Output directory path
     sampling_rate : float
         Sampling rate in Hz
-    lowcut : float, optional
-        Low cutoff frequency in Hz (default: 0.05)
-    highcut : float, optional
-        High cutoff frequency in Hz (default: 2.0)
+    passband : str or tuple, optional
+        Preset name or tuple of (lowcut, highcut) in Hz.
+        Presets: 'default' (0.05-2.0 Hz), 'resting_adult' (0.05-1.0 Hz),
+        'narrow_band' (0.1-0.35 Hz), 'wide_band' (0.05-3.0 Hz).
+        Default: 'resting_adult'
     order : int, optional
         Filter order (default: 2)
     """
