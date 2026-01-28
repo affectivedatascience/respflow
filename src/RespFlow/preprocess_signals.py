@@ -123,6 +123,25 @@ def bandpass_filter_signals(in_path: str, out_path: str, sampling_rate: int, pas
     order : int, optional
         Filter order (default: 2)
     """
+    
+    PASSBANDS = {
+        'default': (0.05, 2.0),
+        'resting_adult': (0.05, 1),
+        'narrow_band': (0.1, 0.35),
+        'wide_band': (0.05, 3.0)
+    }
+    
+    # Determine lowcut and highcut from passband argument
+    if isinstance(passband, str):
+        if passband in PASSBANDS:
+            lowcut, highcut = PASSBANDS[passband]
+        else:
+            raise ValueError(f"Unknown passband preset '{passband}'. Available: {list(PASSBANDS.keys())}")
+    elif isinstance(passband, (tuple, list)) and len(passband) == 2:
+        lowcut, highcut = passband
+    else:
+        raise ValueError("passband must be a string preset or a tuple of (lowcut, highcut)")
+
     mapped_files = map_files(in_path, file_ext='csv')
 
     in_path_obj = Path(in_path)
