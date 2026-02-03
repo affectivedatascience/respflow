@@ -21,7 +21,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
     
 
     # Define all processing stages in order
-    stages = ['raw', 'notch', 'bandpass', 'fwr', 'screened', 'filled', 'smooth', 'feature']
+    stages = ['raw', 'detrend', 'bandpass', 'fwr', 'screened', 'filled', 'smooth', 'feature']
 
     app = Dash()
 
@@ -101,7 +101,6 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
         # Reverse viridis to have lighter colours for earlier stages
         viridis_colors = px.colors.sequential.Viridis[::-1] 
 
-
         for idx, stage in enumerate(selected_stages):
             # 1. Find the file
             path = get_file_path(mapped_files, selected_file, stage)
@@ -133,4 +132,4 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
         return fig
     
     
-    app.run(debug=True)
+    app.run(debug=False)
