@@ -3,6 +3,7 @@ from scipy.signal import butter, sosfiltfilt
 import pandas as pd
 from pathlib import Path
 from scipy.ndimage import median_filter
+import numpy as np
 
 #
 # =============================================================================
@@ -19,10 +20,36 @@ A collection of functions for preprocessing signals.
 
 def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds: int = 60) -> tuple:
     # 60-second window default based on BreathMetrics paper
-    window_size = int(window_size_seconds * sampling_rate)
+    # if signal is shorter than window, use global median
 
-    # Calculate rolling median
-    baseline = median_filter(signal, size=window_size)
+    W0 = window_size_seconds  # seconds
+    N = len(signal)
+    signal_duration = N / sampling_rate
+
+    use_rolling = (signal_duration >= W0)
+
+    if use_rolling:
+        k = int(round(W0 * sampling_rate))  # window length in samples
+        if k % 2 == 0:
+            k += 1
+
+        # Guard: do not use a window longer than the signal
+        if k <= N:
+            s = pd.Series(signal)
+
+            # NaN-safe centered rolling median baseline
+            baseline = (
+                s.rolling(window=k, center=True, min_periods=max(1, k // 2))
+                .median()
+            )
+
+            # If baseline has NaNs (edges or long NaN runs), fill from nearest valid values
+            baseline = baseline.ffill().bfill().to_numpy()
+        else:
+            baseline = np.full(N, np.nanmedian(signal))
+    else:
+        baseline = np.full(N, np.nanmedian(signal))
+
 
     # Detrend
     detrended_signal = signal - baseline
