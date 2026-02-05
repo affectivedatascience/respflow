@@ -74,7 +74,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
         """
         if not os.path.exists(filepath):
             return None
-            
+
         try:
             df = pd.read_csv(filepath)
             if len(df) > max_points:
@@ -92,7 +92,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
         [Input('file-dropdown', 'value'),
         Input('stage-checklist', 'value')]
     )
-    def update_graph(selected_file, selected_stages, max_points=10000):
+    def update_graph(selected_file, selected_stages):
         if not selected_file or not selected_stages:
             return go.Figure()
 
@@ -114,12 +114,15 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
 
             # 3. Add to plot
             color = viridis_colors[idx % len(viridis_colors)]
-            fig.add_trace(go.Scatter(
+
+            # Data trace - blank gaps where NaN
+            fig.add_trace(go.Scattergl(
                 x=df[df.columns[0]],
                 y=df[df.columns[1]],
                 mode='lines',
                 name=stage,
-                line=dict(color=color, width=1.5)
+                line=dict(color=color, width=1.5),
+                connectgaps=False
             ))
 
         # 4. Final Polish
