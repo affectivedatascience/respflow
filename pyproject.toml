@@ -9,6 +9,9 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 dynamic = ["version", "description"]
+dependencies = [
+    "adtk",
+]
 
 [project.urls]
 Home = "https://github.com/garciadavid2000/RespFlow-Python-Package"
