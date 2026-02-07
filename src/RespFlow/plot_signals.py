@@ -56,6 +56,15 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
                 style={'columnCount': 2}
             )
         ], style={'marginBottom': '20px'}),
+        # Checkbox for showing anomaly mask
+        html.Div([
+            dcc.Checklist(
+                id='anomaly-checkbox',
+                options=[{'label': ' Show anomaly mask', 'value': 'show'}],
+                value=[],
+                inline=True
+            )
+        ], style={'marginBottom': '20px'}),
         # Graph for displaying the breathing signals
         dcc.Graph(figure={}, id='breathing_chart')
     ])
@@ -90,23 +99,37 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
     @callback(
         Output('breathing_chart', 'figure'),
         [Input('file-dropdown', 'value'),
-        Input('stage-checklist', 'value')]
+        Input('stage-checklist', 'value'),
+        Input('anomaly-checkbox', 'value')]
     )
-    def update_graph(selected_file, selected_stages):
+    def update_graph(selected_file, selected_stages, show_anomaly):
         if not selected_file or not selected_stages:
             return go.Figure()
 
-        fig = go.Figure()
-        
+        from plotly.subplots import make_subplots
+
+        # Create figure with secondary y-axis if anomaly mask is shown
+        if show_anomaly and 'show' in show_anomaly:
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+        else:
+            fig = go.Figure()
+
         # Reverse viridis to have lighter colours for earlier stages
-        viridis_colors = px.colors.sequential.Viridis[::-1] 
+        viridis_colors = px.colors.sequential.Viridis[::-1]
+
+        # Load anomaly data from screened stage if checkbox is checked
+        anomaly_df = None
+        if show_anomaly and 'show' in show_anomaly:
+            screened_path = get_file_path(mapped_files, selected_file, 'screened')
+            if screened_path:
+                anomaly_df = load_and_downsample(screened_path, max_points)
 
         for idx, stage in enumerate(selected_stages):
             # 1. Find the file
             path = get_file_path(mapped_files, selected_file, stage)
             if not path:
                 continue
-                
+
             # 2. Load the data
             df = load_and_downsample(path, max_points)
             if df is None:
@@ -123,15 +146,36 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
                 name=stage,
                 line=dict(color=color, width=1.5),
                 connectgaps=False
-            ))
+            ), secondary_y=False if show_anomaly and 'show' in show_anomaly else None)
 
-        # 4. Final Polish
+        # 4. Add anomaly mask overlay (once, from screened stage)
+        if show_anomaly and 'show' in show_anomaly and anomaly_df is not None:
+            # Look for anomaly column (e.g., Respiration_anomaly)
+            signal_col = anomaly_df.columns[1]
+            anomaly_col = f"{signal_col}_anomaly"
+            if anomaly_col in anomaly_df.columns:
+                fig.add_trace(go.Scattergl(
+                    x=anomaly_df[anomaly_df.columns[0]],
+                    y=anomaly_df[anomaly_col],
+                    mode='lines',
+                    name='anomaly mask',
+                    line=dict(color='red', width=1.5),
+                    opacity=0.7,
+                    connectgaps=False
+                ), secondary_y=True)
+
+        # 5. Final Polish
         fig.update_layout(
             title=f'Breathing Signal - {selected_file}',
             hovermode='x unified',
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
         )
-        
+
+        # Update y-axes labels if using secondary axis
+        if show_anomaly and 'show' in show_anomaly:
+            fig.update_yaxes(title_text="Signal", secondary_y=False)
+            fig.update_yaxes(title_text="Anomaly (0/1)", secondary_y=True)
+
         return fig
     
     
