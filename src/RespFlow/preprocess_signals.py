@@ -127,6 +127,84 @@ def apply_bandpass(data: list | tuple, sampling_rate: int, lowcut: float = 0.05,
     return y
 
 
+def min_viable_length_sosfiltfilt(
+    sampling_rate: int,
+    lowcut: float = 0.05,
+    highcut: float = 2.0,
+    order: int = 2,
+) -> dict:
+    """
+    Compute the SciPy sosfiltfilt *default* padlen for a Butterworth bandpass and
+    return the minimum viable segment length N_min such that padlen < N-1.
+
+    Returns:
+        {
+          "n_sections": int,
+          "padlen_default": int,
+          "min_sequence_length": int
+        }
+    """
+    nyquist = 0.5 * sampling_rate
+    low = lowcut / nyquist
+    high = highcut / nyquist
+
+    sos = butter(order, [low, high], btype="band", output="sos")
+    n_sections = sos.shape[0]
+
+    # From SciPy docs for sosfiltfilt default padding length:
+    # padlen_default = 3 * (2*n_sections + 1 - min(z0, p0))
+    # where z0 is the number of zeros at the origin, p0 is the number of poles at the origin.
+    z0 = int(np.sum(sos[:, 2] == 0.0))  # b2 == 0 indicates a zero at z=0
+    p0 = int(np.sum(sos[:, 5] == 0.0))  # a2 == 0 indicates a pole at z=0
+    padlen_default = int(3 * (2 * n_sections + 1 - min(z0, p0)))
+
+    # sosfiltfilt requires padlen < N-1  =>  N >= padlen + 2
+    min_sequence_length = padlen_default + 2
+
+    return {
+        "n_sections": int(n_sections),
+        "padlen_default": int(padlen_default),
+        "min_sequence_length": int(min_sequence_length),
+    }
+    
+def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
+    """
+    Return (start, end) index pairs for contiguous non-NaN regions ("islands")
+    in a 1D array x. Indices are half-open: [start, end).
+
+    Example: if x[10:25] are non-NaN, returns (10, 25).
+    """
+    x = np.asarray(x)
+    if x.ndim != 1:
+        raise ValueError("nan_islands expects a 1D array")
+
+    valid = ~np.isnan(x)
+
+    # Find rising edges (False->True) and falling edges (True->False)
+    d = np.diff(valid.astype(np.int8))
+    starts = np.where(d == 1)[0] + 1
+    ends   = np.where(d == -1)[0] + 1
+
+    # Handle island starting at index 0
+    if valid[0]:
+        starts = np.r_[0, starts]
+
+    # Handle island ending at last index
+    if valid[-1]:
+        ends = np.r_[ends, len(x)]
+
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def iter_nan_islands(x: np.ndarray):
+    """
+    Generator yielding (start, end, segment) for each non-NaN island.
+    """
+    x = np.asarray(x)
+    for start, end in nan_islands(x):
+        yield start, end, x[start:end]
+
+
 # Strictly needs path_names (raw files), and sampling rate
 # optional is upper and lower frequency for bandpass filter
 def bandpass_filter_signals(in_path: str, out_path: str, sampling_rate: int, passband: str | tuple = 'default', order: int = 2) -> None:
