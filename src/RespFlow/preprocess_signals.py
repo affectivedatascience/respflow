@@ -205,6 +205,32 @@ def iter_nan_islands(x: np.ndarray):
         yield start, end, x[start:end]
 
 
+def apply_bandpass_nan_safe(data: np.ndarray, sampling_rate: int, lowcut: float, highcut: float, order: int) -> np.ndarray:
+    """
+    NaN-safe wrapper for apply_bandpass. Filters each contiguous non-NaN
+    segment independently, leaving NaN regions untouched.
+    """
+    data = np.asarray(data, dtype=float)
+
+    # If no NaNs, use the fast path
+    if not np.any(np.isnan(data)):
+        return apply_bandpass(data, sampling_rate, lowcut, highcut, order)
+
+    # Get minimum viable segment length
+    min_len = min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
+
+    # Start with all NaN output
+    result = np.full_like(data, np.nan)
+
+    # Filter each valid island
+    for start, end, segment in iter_nan_islands(data):
+        if len(segment) >= min_len:
+            result[start:end] = apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
+        # else: leave as NaN (segment too short to filter)
+
+    return result
+
+
 # Strictly needs path_names (raw files), and sampling rate
 # optional is upper and lower frequency for bandpass filter
 def bandpass_filter_signals(in_path: str, out_path: str, sampling_rate: int, passband: str | tuple = 'default', order: int = 2) -> None:
@@ -259,7 +285,7 @@ def bandpass_filter_signals(in_path: str, out_path: str, sampling_rate: int, pas
         # Apply bandpass filter to all columns except 'time'
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_bandpass(df[column].values, sampling_rate, lowcut, highcut, order)
+                df[column] = apply_bandpass_nan_safe(df[column].values, sampling_rate, lowcut, highcut, order)
 
         # Determine the relative path from in_path to preserve folder structure
         file_path_obj = Path(file_path)
