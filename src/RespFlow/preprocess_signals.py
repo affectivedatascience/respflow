@@ -439,7 +439,7 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
 #
 
 # Physiological constant: typical resting respiratory rate
-RESTING_RR_HZ = 0.5  # 0.5 Hz ≈ 30 breaths/min (upper bound for resting adults)
+RESTING_RR_HZ = 0.25  # 0.25 Hz ≈ 15 breaths/min (upper bound for resting adults)
 
 
 def default_max_gap(sampling_rate: int, rr: float = RESTING_RR_HZ) -> int:
