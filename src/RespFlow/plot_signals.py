@@ -21,7 +21,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
     
 
     # Define all processing stages in order
-    stages = ['raw', 'detrend', 'bandpass', 'fwr', 'screened', 'filled', 'smooth', 'feature']
+    stages = ['raw', 'hard_fault', 'detrend', 'micro_interp', 'bandpass', 'fwr', 'screened', 'filled', 'smooth', 'feature']
 
     app = Dash()
 

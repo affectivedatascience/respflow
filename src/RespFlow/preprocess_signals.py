@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 from scipy.ndimage import median_filter
 import numpy as np
+from dataclasses import dataclass
 
 #
 # =============================================================================
@@ -12,6 +13,306 @@ import numpy as np
 """
 A collection of functions for preprocessing signals.
 """
+
+#
+# HARD FAULT
+# =============================================================================
+#
+
+@dataclass
+class HardFaultConfig:
+    """
+    Hard-fault detection parameters.
+
+    Hard faults are unambiguous sensor/data failures that should be masked
+    before detrend, micro-gap fill, and bandpass filtering.
+    """
+    # Flatline / stuck sensor
+    flat_min_s: float = 1.0              # minimum duration to qualify as flatline
+    flat_sensitivity: float = 0.05       # multiplier on MAD(dx) for flatline threshold
+
+    # Clipping / saturation (data-driven rails)
+    clip_percentile: float = 0.1         # lower percentile for rail detection (upper = 100 - this)
+    clip_min_run_s: float = 0.25         # minimum clipping run duration (seconds)
+
+    # Step/discontinuity spikes
+    step_sensitivity: float = 12.0       # multiplier on MAD(dx) for step threshold
+    step_pad_s: float = 0.05             # pad around steps (seconds)
+    step_verify_window_s: float = 0.5    # window (seconds) to check sustained level shift
+
+    # Optional: pad around any hard fault
+    fault_pad_s: float = 0.0             # additional dilation of final hard-fault mask (seconds)
+
+
+def _runs_from_mask(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return (start, end) half-open index pairs for contiguous True-runs."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0:
+        return []
+    d = np.diff(mask.astype(np.int8))
+    starts = np.where(d == 1)[0] + 1
+    ends = np.where(d == -1)[0] + 1
+    if mask[0]:
+        starts = np.r_[0, starts]
+    if mask[-1]:
+        ends = np.r_[ends, mask.size]
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _apply_min_run_length(mask: np.ndarray, min_len: int) -> np.ndarray:
+    """Keep only True-runs of length >= min_len."""
+    mask = np.asarray(mask, dtype=bool)
+    if min_len <= 1:
+        return mask
+    out = np.zeros_like(mask, dtype=bool)
+    for a, b in _runs_from_mask(mask):
+        if (b - a) >= min_len:
+            out[a:b] = True
+    return out
+
+
+def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Dilate a boolean mask by +/- radius samples using convolution."""
+    mask = np.asarray(mask, dtype=bool)
+    if radius <= 0 or mask.size == 0:
+        return mask
+    kernel = np.ones(2 * radius + 1, dtype=int)
+    return np.convolve(mask.astype(int), kernel, mode="same") > 0
+
+
+def _robust_mad(x: np.ndarray) -> float:
+    """NaN-safe median absolute deviation (MAD)."""
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    if x.size == 0:
+        return np.nan
+    med = np.median(x)
+    return float(np.median(np.abs(x - med)))
+
+
+def apply_hard_fault(
+    signal: np.ndarray,
+    sampling_rate: int,
+    config: HardFaultConfig | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """
+    Detect hard faults and set them to NaN.
+
+    Returns:
+        signal_out: signal with hard-fault samples set to NaN
+        info: dict with masks and thresholds used
+    """
+    x = np.asarray(signal, dtype=float).copy()
+    if x.ndim != 1:
+        raise ValueError("apply_hard_fault expects a 1D signal.")
+
+    N = x.size
+    fs = float(sampling_rate)
+    if config is None:
+        config = HardFaultConfig()
+
+    mask_nan = np.isnan(x)
+
+    # Early return for very short or fully-missing signals
+    if N < 3 or np.all(mask_nan):
+        mask_hardfault = mask_nan.copy()
+        x[mask_hardfault] = np.nan
+        info = {
+            "mask_nan": mask_nan,
+            "mask_flatline": np.zeros(N, dtype=bool),
+            "mask_clip": np.zeros(N, dtype=bool),
+            "mask_step": np.zeros(N, dtype=bool),
+            "mask_hardfault": mask_hardfault,
+            "runs_hardfault": _runs_from_mask(mask_hardfault),
+        }
+        return x, info
+
+    # Robust scales (computed on available data)
+    mad_x = _robust_mad(x)
+    dx = np.diff(x)  # NaNs propagate into dx where adjacent samples include NaN
+    mad_dx = _robust_mad(dx)
+
+    if not np.isfinite(mad_x) or mad_x <= 0:
+        mad_x = np.finfo(float).eps
+    if not np.isfinite(mad_dx) or mad_dx <= 0:
+        mad_dx = np.finfo(float).eps
+
+    # -------------------------------------------------------------------------
+    # Flatline / stuck sensor (near-zero first differences sustained)
+    # -------------------------------------------------------------------------
+    flat_eps = max(
+        config.flat_sensitivity * mad_dx,
+        1e-4 * mad_x,       # safety floor: fraction of signal scale
+        np.finfo(float).eps,
+    )
+
+    dx_abs = np.abs(dx)
+    mask_dx_small = (dx_abs <= flat_eps) & ~np.isnan(dx)
+
+    min_flat_samples = int(np.ceil(config.flat_min_s * fs))
+    mask_flatline = np.zeros(N, dtype=bool)
+
+    # A run of small dx from [a, b) implies constant samples [a, b+1)
+    for run_start, run_end in _runs_from_mask(mask_dx_small):
+        sample_start, sample_end = run_start, min(N, run_end + 1)
+        if (sample_end - sample_start) >= min_flat_samples:
+            mask_flatline[sample_start:sample_end] = True
+
+    mask_flatline &= ~mask_nan
+
+    # -------------------------------------------------------------------------
+    # Clipping / saturation (runs near inferred rails)
+    # -------------------------------------------------------------------------
+    valid_signal = x[~mask_nan]
+    rail_low = np.percentile(valid_signal, config.clip_percentile)
+    rail_high = np.percentile(valid_signal, 100 - config.clip_percentile)
+    clip_tol = 0.01 * mad_x
+
+    mask_clip_raw = (~mask_nan) & ((x <= rail_low + clip_tol) | (x >= rail_high - clip_tol))
+    min_clip_samples = int(np.ceil(config.clip_min_run_s * fs))
+    mask_clip = _apply_min_run_length(mask_clip_raw, min_clip_samples)
+
+    # -------------------------------------------------------------------------
+    # Step/discontinuity spikes (robust threshold on dx)
+    # -------------------------------------------------------------------------
+    valid_dx = dx[~np.isnan(dx)]
+    dx_med = float(np.median(valid_dx)) if valid_dx.size else 0.0
+
+    # Floor the threshold so it never collapses for smooth signals
+    step_threshold = max(config.step_sensitivity * mad_dx, 0.5 * mad_x)
+
+    step_candidates = np.where(np.abs(dx - dx_med) > step_threshold)[0]
+    mask_step = np.zeros(N, dtype=bool)
+    step_pad = int(np.ceil(config.step_pad_s * fs))
+
+    verify_win = int(np.ceil(config.step_verify_window_s * fs))
+    min_shift = 0.3 * mad_x
+    # Massive spikes (3x threshold) bypass verification
+    spike_bypass_thr = 3.0 * step_threshold
+
+    for i in step_candidates:
+        dx_mag = abs(float(dx[i]) - dx_med)
+
+        # Massive spike — flag unconditionally, no verification needed
+        if dx_mag >= spike_bypass_thr:
+            mask_start = max(0, i - step_pad)
+            mask_end = min(N, i + 2 + step_pad)
+            mask_step[mask_start:mask_end] = True
+            continue
+
+        # Moderate spike — verify sustained level shift
+        before_start = max(0, i - verify_win)
+        after_end = min(N, i + 2 + verify_win)
+        seg_before = x[before_start:i]
+        seg_after = x[i + 1:after_end]
+
+        seg_before = seg_before[~np.isnan(seg_before)]
+        seg_after = seg_after[~np.isnan(seg_after)]
+
+        if seg_before.size == 0 or seg_after.size == 0:
+            continue
+
+        shift = abs(float(np.median(seg_after)) - float(np.median(seg_before)))
+        if shift < min_shift:
+            continue
+
+        mask_start = max(0, i - step_pad)
+        mask_end = min(N, i + 2 + step_pad)
+        mask_step[mask_start:mask_end] = True
+
+    mask_step &= ~mask_nan
+
+    # -------------------------------------------------------------------------
+    # Combine and pad
+    # -------------------------------------------------------------------------
+    mask_hardfault = mask_nan | mask_flatline | mask_clip | mask_step
+
+    if config.fault_pad_s and config.fault_pad_s > 0:
+        fault_pad = int(np.ceil(config.fault_pad_s * fs))
+        mask_hardfault = _dilate_mask(mask_hardfault, fault_pad)
+
+    x[mask_hardfault] = np.nan
+
+    info: dict[str, object] = {
+        "mask_nan": mask_nan,
+        "mask_flatline": mask_flatline,
+        "mask_clip": mask_clip,
+        "mask_step": mask_step,
+        "mask_hardfault": mask_hardfault,
+        "runs_hardfault": _runs_from_mask(mask_hardfault),
+        "mad_x": mad_x,
+        "mad_dx": mad_dx,
+        "flat_eps": flat_eps,
+        "rail_low": rail_low,
+        "rail_high": rail_high,
+        "clip_tol": clip_tol,
+        "step_threshold": step_threshold,
+    }
+    return x, info
+
+
+def apply_hard_fault_to_df(
+    df: pd.DataFrame,
+    sampling_rate: int,
+    config: HardFaultConfig | None = None,
+    time_col: str = "time",
+) -> pd.DataFrame:
+    """
+    Apply hard-fault detection to all non-time columns of a dataframe.
+    Replaces hard-fault samples with NaN in each signal column.
+    """
+    out = df.copy()
+
+    for column in out.columns:
+        if column.lower() == time_col.lower():
+            continue
+
+        x = out[column].to_numpy(dtype=float)
+        x_hf, _info = apply_hard_fault(x, sampling_rate, config=config)
+        out[column] = x_hf
+
+    return out
+
+
+def hard_fault_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    config: HardFaultConfig | None = None,
+) -> None:
+    """
+    Applies hard-fault detection to all columns except 'time' in all CSV files.
+    Preserves folder structure from in_path to out_path.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path
+    out_path : str
+        Output directory path
+    sampling_rate : int
+        Sampling rate in Hz
+    config : HardFaultConfig, optional
+        Detection configuration. Uses defaults if None.
+    """
+    mapped_files = map_files(in_path, file_ext='csv')
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        df2 = apply_hard_fault_to_df(df, sampling_rate, config=config)
+
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        df2.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
 # DETREND
@@ -56,6 +357,7 @@ def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds:
 
     return detrended_signal, baseline
 
+
 def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size_seconds: int = 60) -> None:
     """
     Applies detrending to all columns except 'time' in all CSV files.
@@ -99,6 +401,192 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Save the detrended data
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+
+#
+# MICRO INTERP
+# =============================================================================
+#
+
+# Physiological constant: typical resting respiratory rate
+RESTING_RR_HZ = 0.25  # 0.25 Hz ≈ 15 breaths/min (upper bound for resting adults)
+
+
+def default_max_gap(sampling_rate: int, resting_rate: float = RESTING_RR_HZ) -> int:
+    """
+    Compute a default max_gap (in samples) for NaN micro gap interpolation.
+
+    Rule: 30% of one respiratory cycle length.
+    At 2000 Hz, 0.25 Hz: 0.3 * (2000 / 0.25) = 2400 samples.
+    """
+    return int(round(0.3 * sampling_rate / resting_rate))
+
+def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
+    """
+    Return (start, end, length) for each contiguous NaN gap in a 1D array.
+    Indices are half-open: x[start:end] are all NaN.
+    """
+    x = np.asarray(x)
+    is_nan = np.isnan(x)
+
+    if not np.any(is_nan):
+        return []
+
+    d = np.diff(is_nan.astype(np.int8))
+    starts = np.where(d == 1)[0] + 1
+    ends = np.where(d == -1)[0] + 1
+
+    if is_nan[0]:
+        starts = np.r_[0, starts]
+    if is_nan[-1]:
+        ends = np.r_[ends, len(x)]
+
+    return [(s, e, e - s) for s, e in zip(starts.tolist(), ends.tolist())]
+
+def interpolate_nan_gaps(
+    data: np.ndarray,
+    method: str,
+    max_gap: int | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Interpolate NaN gaps in data.
+
+    Parameters:
+        data: 1D array with NaN gaps
+        method: "pchip" or "cubic"
+        max_gap: If provided, only interpolate gaps with length <= max_gap
+
+    Returns:
+        (interpolated_data, nan_mask) where nan_mask marks original NaN positions
+    """
+    from scipy.interpolate import PchipInterpolator, CubicSpline
+
+    data = np.asarray(data, dtype=float)
+    nan_mask = np.isnan(data)
+
+    if not np.any(nan_mask):
+        return data.copy(), nan_mask
+
+    result = data.copy()
+    gaps = nan_gap_indices(data)
+
+    # Determine which gaps to interpolate
+    if max_gap is not None:
+        gaps_to_fill = [(s, e) for s, e, length in gaps if length <= max_gap]
+    else:
+        gaps_to_fill = [(s, e) for s, e, _ in gaps]
+
+    if not gaps_to_fill:
+        return result, nan_mask
+
+    # Build mask of indices to interpolate
+    fill_mask = np.zeros(len(data), dtype=bool)
+    for s, e in gaps_to_fill:
+        fill_mask[s:e] = True
+
+    # Get valid (non-NaN) indices and values for interpolation
+    valid_idx = np.where(~nan_mask)[0]
+    valid_vals = data[valid_idx]
+
+    if len(valid_idx) < 2:
+        return result, nan_mask  # Can't interpolate with < 2 points
+
+    # Create interpolator defaulting to pchip
+    if method == "pchip":
+        interp = PchipInterpolator(valid_idx, valid_vals)
+    elif method == "cubic_spline":
+        interp = CubicSpline(valid_idx, valid_vals)
+    else:
+        raise ValueError("Invalid interpolation method specified")
+        
+    
+
+    # Fill only the gaps we want to fill
+    fill_idx = np.where(fill_mask)[0]
+    result[fill_idx] = interp(fill_idx)
+
+    return result, nan_mask
+
+
+def apply_micro_interp(
+    signal: np.ndarray,
+    sampling_rate: int,
+    max_gap: int | None = None,
+    interp_method: str = "pchip"
+) -> np.ndarray:
+    """
+    Interpolate small NaN gaps in a 1D signal.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        1D input signal (may contain NaN).
+    sampling_rate : int
+        Sampling rate in Hz.
+    max_gap : int or None
+        Maximum gap size (samples) to interpolate. If None, uses
+        default_max_gap(sampling_rate).
+    interp_method : str
+        Interpolation method: "pchip" (default) or "cubic_spline".
+
+    Returns
+    -------
+    np.ndarray
+        Signal with small NaN gaps filled via interpolation.
+    """
+    signal = np.asarray(signal, dtype=float)
+
+    if max_gap is None:
+        max_gap = default_max_gap(sampling_rate)
+
+    filled, _nan_mask = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+    return filled
+
+
+def micro_interp_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    max_gap: int | None = None,
+    interp_method: str = "pchip"
+) -> None:
+    """
+    Interpolate small NaN gaps in all columns except 'time' in all CSV files.
+    Preserves folder structure from in_path to out_path.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path
+    out_path : str
+        Output directory path
+    sampling_rate : int
+        Sampling rate in Hz
+    max_gap : int, optional
+        Maximum gap size (samples) to interpolate. If None, uses
+        default_max_gap(sampling_rate).
+    interp_method : str, optional
+        Interpolation method: "pchip" (default) or "cubic_spline".
+    """
+    mapped_files = map_files(in_path, file_ext='csv')
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        for column in df.columns:
+            if column.lower() != 'time':
+                df[column] = apply_micro_interp(df[column].values, sampling_rate, max_gap, interp_method)
+
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
         df.to_csv(output_file_path, index=False)
 
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
@@ -166,93 +654,6 @@ def min_viable_length_sosfiltfilt(
         "padlen_default": int(padlen_default),
         "min_sequence_length": int(min_sequence_length),
     }
-    
-def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
-    """
-    Return (start, end, length) for each contiguous NaN gap in a 1D array.
-    Indices are half-open: x[start:end] are all NaN.
-    """
-    x = np.asarray(x)
-    is_nan = np.isnan(x)
-
-    if not np.any(is_nan):
-        return []
-
-    d = np.diff(is_nan.astype(np.int8))
-    starts = np.where(d == 1)[0] + 1
-    ends = np.where(d == -1)[0] + 1
-
-    if is_nan[0]:
-        starts = np.r_[0, starts]
-    if is_nan[-1]:
-        ends = np.r_[ends, len(x)]
-
-    return [(s, e, e - s) for s, e in zip(starts.tolist(), ends.tolist())]
-
-
-def interpolate_nan_gaps(
-    data: np.ndarray,
-    method: str,
-    max_gap: int | None = None
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Interpolate NaN gaps in data.
-
-    Parameters:
-        data: 1D array with NaN gaps
-        method: "pchip" or "cubic"
-        max_gap: If provided, only interpolate gaps with length <= max_gap
-
-    Returns:
-        (interpolated_data, nan_mask) where nan_mask marks original NaN positions
-    """
-    from scipy.interpolate import PchipInterpolator, CubicSpline
-
-    data = np.asarray(data, dtype=float)
-    nan_mask = np.isnan(data)
-
-    if not np.any(nan_mask):
-        return data.copy(), nan_mask
-
-    result = data.copy()
-    gaps = nan_gap_indices(data)
-
-    # Determine which gaps to interpolate
-    if max_gap is not None:
-        gaps_to_fill = [(s, e) for s, e, length in gaps if length <= max_gap]
-    else:
-        gaps_to_fill = [(s, e) for s, e, _ in gaps]
-
-    if not gaps_to_fill:
-        return result, nan_mask
-
-    # Build mask of indices to interpolate
-    fill_mask = np.zeros(len(data), dtype=bool)
-    for s, e in gaps_to_fill:
-        fill_mask[s:e] = True
-
-    # Get valid (non-NaN) indices and values for interpolation
-    valid_idx = np.where(~nan_mask)[0]
-    valid_vals = data[valid_idx]
-
-    if len(valid_idx) < 2:
-        return result, nan_mask  # Can't interpolate with < 2 points
-
-    # Create interpolator defaulting to pchip
-    if method == "pchip":
-        interp = PchipInterpolator(valid_idx, valid_vals)
-    elif method == "cubic_spline":
-        interp = CubicSpline(valid_idx, valid_vals)
-    else:
-        raise ValueError("Invalid interpolation method specified")
-        
-    
-
-    # Fill only the gaps we want to fill
-    fill_idx = np.where(fill_mask)[0]
-    result[fill_idx] = interp(fill_idx)
-
-    return result, nan_mask
 
 
 def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
@@ -299,19 +700,16 @@ def apply_bandpass_nan_safe(
     lowcut: float,
     highcut: float,
     order: int,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
 ) -> np.ndarray:
     """
-    NaN-safe bandpass filter using interpolation.
+    NaN-safe bandpass filter.
+
+    If the signal has no NaNs, filters directly. If NaNs remain (e.g. large
+    unfilled gaps), filters each contiguous non-NaN island separately.
 
     Parameters:
         data: Input signal (may contain NaN)
         sampling_rate, lowcut, highcut, order: Filter parameters
-        max_gap: Max gap size (samples) to interpolate. If None, interpolate all gaps.
-                 Gaps larger than max_gap remain as NaN in output.
-        interp_method: Specified interpolation method. Defaults to pchip.
-                 Alternatively user can specify "cubic_spline".
     """
     data = np.asarray(data, dtype=float)
 
@@ -319,26 +717,13 @@ def apply_bandpass_nan_safe(
     if not np.any(np.isnan(data)):
         return apply_bandpass(data, sampling_rate, lowcut, highcut, order)
 
-    # Interpolate gaps
-    interpolated, original_nan_mask = interpolate_nan_gaps(data, method=interp_method, max_gap=max_gap)
+    # NaNs present — filter each non-NaN island separately
+    min_len = min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
+    result = np.full_like(data, np.nan)
 
-    # Determine which NaNs were NOT filled (large gaps when max_gap is set)
-    still_nan = np.isnan(interpolated)
-
-    if np.any(still_nan):
-        # Some gaps weren't filled - filter valid segments only
-        min_len = min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
-        result = np.full_like(data, np.nan)
-
-        for start, end, segment in iter_nan_islands(interpolated):
-            if len(segment) >= min_len:
-                result[start:end] = apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
-    else:
-        # All gaps filled - filter entire signal
-        result = apply_bandpass(interpolated, sampling_rate, lowcut, highcut, order)
-
-    # Restore original NaN positions
-    # result[original_nan_mask] = np.nan
+    for start, end, segment in iter_nan_islands(data):
+        if len(segment) >= min_len:
+            result[start:end] = apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
 
     return result
 
@@ -351,8 +736,6 @@ def bandpass_filter_signals(
     sampling_rate: int,
     passband: str | tuple = 'default',
     order: int = 2,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
 ) -> None:
     """
     Applies a Butterworth bandpass filter to all columns except 'time' in all CSV files.
@@ -370,17 +753,10 @@ def bandpass_filter_signals(
         Preset name or tuple of (lowcut, highcut) in Hz.
         Presets: 'default' (0.05-2.0 Hz), 'resting_adult' (0.05-1.0 Hz),
         'narrow_band' (0.1-0.35 Hz), 'wide_band' (0.05-3.0 Hz).
-        Default: 'resting_adult'
+        Default: 'default'
     order : int, optional
         Filter order (default: 2)
-    max_gap : int, optional
-        Maximum gap size (in samples) to interpolate over. If None, all NaN gaps
-        are interpolated before filtering. Gaps larger than max_gap remain as NaN
-        in the output. (default: None)
-    interp_method : Specified interpolation method. Defaults to pchip.
-        Alternatively user can specify "cubic_spline".
     """
-    
     PASSBANDS = {
         'default': (0.05, 2.0),
         'resting_adult': (0.05, 1),
@@ -411,7 +787,7 @@ def bandpass_filter_signals(
         # Apply bandpass filter to all columns except 'time'
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_bandpass_nan_safe(df[column].values, sampling_rate, lowcut, highcut, order, max_gap, interp_method=interp_method)
+                df[column] = apply_bandpass_nan_safe(df[column].values, sampling_rate, lowcut, highcut, order)
 
         # Determine the relative path from in_path to preserve folder structure
         file_path_obj = Path(file_path)
