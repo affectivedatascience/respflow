@@ -29,23 +29,16 @@ class HardFaultConfig:
     """
     # Flatline / stuck sensor
     flat_min_s: float = 1.0              # minimum duration to qualify as flatline
-    flat_eps_abs: float = 0.0            # absolute threshold on |dx| (optional)
-    flat_eps_frac_mad_x: float = 1e-4    # eps component as fraction of MAD(x)
-    flat_eps_k_mad_dx: float = 0.05      # eps component as fraction of MAD(dx)
+    flat_sensitivity: float = 0.05       # multiplier on MAD(dx) for flatline threshold
 
     # Clipping / saturation (data-driven rails)
-    clip_low_pct: float = 0.1
-    clip_high_pct: float = 99.9
-    clip_tol_frac_mad_x: float = 0.01
-    clip_min_run_s: float = 0.25
+    clip_percentile: float = 0.1         # lower percentile for rail detection (upper = 100 - this)
+    clip_min_run_s: float = 0.25         # minimum clipping run duration (seconds)
 
     # Step/discontinuity spikes
-    step_k_mad_dx: float = 12.0
+    step_sensitivity: float = 12.0       # multiplier on MAD(dx) for step threshold
     step_pad_s: float = 0.05             # pad around steps (seconds)
-    step_min_thr_frac_mad_x: float = 0.5 # floor: threshold >= this * MAD(x)
     step_verify_window_s: float = 0.5    # window (seconds) to check sustained level shift
-    step_verify_min_shift_frac_mad_x: float = 0.3  # minimum median shift to confirm step
-    step_spike_bypass_k: float = 3.0     # skip verification if |dx| exceeds threshold by this factor
 
     # Optional: pad around any hard fault
     fault_pad_s: float = 0.0             # additional dilation of final hard-fault mask (seconds)
@@ -101,14 +94,13 @@ def apply_hard_fault(
     signal: np.ndarray,
     sampling_rate: int,
     config: HardFaultConfig | None = None,
-    return_info: bool = True,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """
     Detect hard faults and set them to NaN.
 
     Returns:
         signal_out: signal with hard-fault samples set to NaN
-        info: dict with masks and optional thresholds used
+        info: dict with masks and thresholds used
     """
     x = np.asarray(signal, dtype=float).copy()
     if x.ndim != 1:
@@ -148,68 +140,64 @@ def apply_hard_fault(
     # -------------------------------------------------------------------------
     # Flatline / stuck sensor (near-zero first differences sustained)
     # -------------------------------------------------------------------------
-    eps = max(
-        float(config.flat_eps_abs),
-        float(config.flat_eps_frac_mad_x) * mad_x,
-        float(config.flat_eps_k_mad_dx) * mad_dx,
+    flat_eps = max(
+        config.flat_sensitivity * mad_dx,
+        1e-4 * mad_x,       # safety floor: fraction of signal scale
         np.finfo(float).eps,
     )
 
     dx_abs = np.abs(dx)
-    mask_dx_small = (dx_abs <= eps) & ~np.isnan(dx)
+    mask_dx_small = (dx_abs <= flat_eps) & ~np.isnan(dx)
 
     min_flat_samples = int(np.ceil(config.flat_min_s * fs))
     mask_flatline = np.zeros(N, dtype=bool)
 
-    # A run of dx_small from [a, b) implies constant samples [a, b+1)
-    for a, b in _runs_from_mask(mask_dx_small):
-        sa, sb = a, min(N, b + 1)
-        if (sb - sa) >= min_flat_samples:
-            mask_flatline[sa:sb] = True
+    # A run of small dx from [a, b) implies constant samples [a, b+1)
+    for run_start, run_end in _runs_from_mask(mask_dx_small):
+        sample_start, sample_end = run_start, min(N, run_end + 1)
+        if (sample_end - sample_start) >= min_flat_samples:
+            mask_flatline[sample_start:sample_end] = True
 
     mask_flatline &= ~mask_nan
 
     # -------------------------------------------------------------------------
     # Clipping / saturation (runs near inferred rails)
     # -------------------------------------------------------------------------
-    xv = x[~mask_nan]
-    lo = np.percentile(xv, config.clip_low_pct)
-    hi = np.percentile(xv, config.clip_high_pct)
-    tol = float(config.clip_tol_frac_mad_x) * mad_x
+    valid_signal = x[~mask_nan]
+    rail_low = np.percentile(valid_signal, config.clip_percentile)
+    rail_high = np.percentile(valid_signal, 100 - config.clip_percentile)
+    clip_tol = 0.01 * mad_x
 
-    mask_clip_raw = (~mask_nan) & ((x <= lo + tol) | (x >= hi - tol))
+    mask_clip_raw = (~mask_nan) & ((x <= rail_low + clip_tol) | (x >= rail_high - clip_tol))
     min_clip_samples = int(np.ceil(config.clip_min_run_s * fs))
     mask_clip = _apply_min_run_length(mask_clip_raw, min_clip_samples)
 
     # -------------------------------------------------------------------------
     # Step/discontinuity spikes (robust threshold on dx)
     # -------------------------------------------------------------------------
-    dxv = dx[~np.isnan(dx)]
-    dx_med = float(np.median(dxv)) if dxv.size else 0.0
+    valid_dx = dx[~np.isnan(dx)]
+    dx_med = float(np.median(valid_dx)) if valid_dx.size else 0.0
 
-    # Fix: floor the threshold so it never collapses for smooth signals
-    thr_dx = float(config.step_k_mad_dx) * mad_dx
-    thr_floor = float(config.step_min_thr_frac_mad_x) * mad_x
-    thr = max(thr_dx, thr_floor)
+    # Floor the threshold so it never collapses for smooth signals
+    step_threshold = max(config.step_sensitivity * mad_dx, 0.5 * mad_x)
 
-    step_candidates = np.where(np.abs(dx - dx_med) > thr)[0]
+    step_candidates = np.where(np.abs(dx - dx_med) > step_threshold)[0]
     mask_step = np.zeros(N, dtype=bool)
     step_pad = int(np.ceil(config.step_pad_s * fs))
 
-    # Fix: verify each candidate by checking for a sustained level shift
     verify_win = int(np.ceil(config.step_verify_window_s * fs))
-    min_shift = float(config.step_verify_min_shift_frac_mad_x) * mad_x
-
-    spike_bypass_thr = config.step_spike_bypass_k * thr
+    min_shift = 0.3 * mad_x
+    # Massive spikes (3x threshold) bypass verification
+    spike_bypass_thr = 3.0 * step_threshold
 
     for i in step_candidates:
         dx_mag = abs(float(dx[i]) - dx_med)
 
         # Massive spike — flag unconditionally, no verification needed
         if dx_mag >= spike_bypass_thr:
-            a = max(0, i - step_pad)
-            b = min(N, i + 2 + step_pad)
-            mask_step[a:b] = True
+            mask_start = max(0, i - step_pad)
+            mask_end = min(N, i + 2 + step_pad)
+            mask_step[mask_start:mask_end] = True
             continue
 
         # Moderate spike — verify sustained level shift
@@ -228,9 +216,9 @@ def apply_hard_fault(
         if shift < min_shift:
             continue
 
-        a = max(0, i - step_pad)
-        b = min(N, i + 2 + step_pad)
-        mask_step[a:b] = True
+        mask_start = max(0, i - step_pad)
+        mask_end = min(N, i + 2 + step_pad)
+        mask_step[mask_start:mask_end] = True
 
     mask_step &= ~mask_nan
 
@@ -254,11 +242,11 @@ def apply_hard_fault(
         "runs_hardfault": _runs_from_mask(mask_hardfault),
         "mad_x": mad_x,
         "mad_dx": mad_dx,
-        "flat_eps": eps,
-        "clip_lo": lo,
-        "clip_hi": hi,
-        "clip_tol": tol,
-        "step_thr": thr,
+        "flat_eps": flat_eps,
+        "rail_low": rail_low,
+        "rail_high": rail_high,
+        "clip_tol": clip_tol,
+        "step_threshold": step_threshold,
     }
     return x, info
 
@@ -268,17 +256,10 @@ def apply_hard_fault_to_df(
     sampling_rate: int,
     config: HardFaultConfig | None = None,
     time_col: str = "time",
-    add_mask_cols: bool = True,
 ) -> pd.DataFrame:
     """
     Apply hard-fault detection to all non-time columns of a dataframe.
-
-    - Replaces hard-fault samples with NaN in each signal column.
-    - Optionally writes mask columns:
-        <col>_mask_hardfault
-        <col>_mask_flatline
-        <col>_mask_clip
-        <col>_mask_step
+    Replaces hard-fault samples with NaN in each signal column.
     """
     out = df.copy()
 
@@ -287,14 +268,8 @@ def apply_hard_fault_to_df(
             continue
 
         x = out[column].to_numpy(dtype=float)
-        x_hf, info = apply_hard_fault(x, sampling_rate, config=config, return_info=True)
+        x_hf, _info = apply_hard_fault(x, sampling_rate, config=config)
         out[column] = x_hf
-
-        if add_mask_cols:
-            out[f"{column}_mask_hardfault"] = info["mask_hardfault"].astype(bool)
-            out[f"{column}_mask_flatline"] = info["mask_flatline"].astype(bool)
-            out[f"{column}_mask_clip"] = info["mask_clip"].astype(bool)
-            out[f"{column}_mask_step"] = info["mask_step"].astype(bool)
 
     return out
 
@@ -304,7 +279,6 @@ def hard_fault_signals(
     out_path: str,
     sampling_rate: int,
     config: HardFaultConfig | None = None,
-    add_mask_cols: bool = False,
 ) -> None:
     """
     Applies hard-fault detection to all columns except 'time' in all CSV files.
@@ -320,9 +294,6 @@ def hard_fault_signals(
         Sampling rate in Hz
     config : HardFaultConfig, optional
         Detection configuration. Uses defaults if None.
-    add_mask_cols : bool, optional
-        Whether to include boolean mask columns in output CSVs (default: False).
-        Set to False to avoid propagating mask columns to downstream steps.
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -332,7 +303,7 @@ def hard_fault_signals(
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
 
-        df2 = apply_hard_fault_to_df(df, sampling_rate, config=config, time_col="time", add_mask_cols=add_mask_cols)
+        df2 = apply_hard_fault_to_df(df, sampling_rate, config=config)
 
         file_path_obj = Path(file_path)
         relative_path = file_path_obj.relative_to(in_path_obj)
