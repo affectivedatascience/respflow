@@ -357,6 +357,7 @@ def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds:
 
     return detrended_signal, baseline
 
+
 def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size_seconds: int = 60) -> None:
     """
     Applies detrending to all columns except 'time' in all CSV files.
@@ -405,7 +406,7 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
-# BANDPASS
+# MICRO INTERP
 # =============================================================================
 #
 
@@ -413,75 +414,15 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
 RESTING_RR_HZ = 0.25  # 0.25 Hz ≈ 15 breaths/min (upper bound for resting adults)
 
 
-def default_max_gap(sampling_rate: int, rr: float = RESTING_RR_HZ) -> int:
+def default_max_gap(sampling_rate: int, resting_rate: float = RESTING_RR_HZ) -> int:
     """
-    Compute a default max_gap (in samples) for NaN interpolation before bandpass.
+    Compute a default max_gap (in samples) for NaN micro gap interpolation.
 
-    Rule: 10% of one respiratory cycle length.
-    At 2000 Hz, 0.5 Hz: 0.1 * (2000 / 0.5) = 400 samples.
+    Rule: 30% of one respiratory cycle length.
+    At 2000 Hz, 0.25 Hz: 0.3 * (2000 / 0.25) = 2400 samples.
     """
-    return int(round(0.1 * sampling_rate / rr))
+    return int(round(0.3 * sampling_rate / resting_rate))
 
-
-def apply_bandpass(data: list | tuple, sampling_rate: int, lowcut: float = 0.05, highcut: float = 2.0, order: int = 2) -> list | tuple:
-    """
-    Applies a zero-phase Butterworth bandpass filter.
-    Standard: 0.05-2.0 Hz for RIP belt data.
-    """
-    nyquist = 0.5 * sampling_rate
-    low = lowcut / nyquist
-    high = highcut / nyquist
-
-    # Design filter
-    sos = butter(order, [low, high], btype='band', output='sos')
-
-    # Apply zero-phase filter (filtfilt) with padlen adjusted for short signals
-    padlen = min(len(data) - 1, 15)
-    y = sosfiltfilt(sos, data, padlen=padlen)
-
-    return y
-
-
-def min_viable_length_sosfiltfilt(
-    sampling_rate: int,
-    lowcut: float = 0.05,
-    highcut: float = 2.0,
-    order: int = 2,
-) -> dict:
-    """
-    Compute the SciPy sosfiltfilt *default* padlen for a Butterworth bandpass and
-    return the minimum viable segment length N_min such that padlen < N-1.
-
-    Returns:
-        {
-          "n_sections": int,
-          "padlen_default": int,
-          "min_sequence_length": int
-        }
-    """
-    nyquist = 0.5 * sampling_rate
-    low = lowcut / nyquist
-    high = highcut / nyquist
-
-    sos = butter(order, [low, high], btype="band", output="sos")
-    n_sections = sos.shape[0]
-
-    # From SciPy docs for sosfiltfilt default padding length:
-    # padlen_default = 3 * (2*n_sections + 1 - min(z0, p0))
-    # where z0 is the number of zeros at the origin, p0 is the number of poles at the origin.
-    z0 = int(np.sum(sos[:, 2] == 0.0))  # b2 == 0 indicates a zero at z=0
-    p0 = int(np.sum(sos[:, 5] == 0.0))  # a2 == 0 indicates a pole at z=0
-    padlen_default = int(3 * (2 * n_sections + 1 - min(z0, p0)))
-
-    # sosfiltfilt requires padlen < N-1  =>  N >= padlen + 2
-    min_sequence_length = padlen_default + 2
-
-    return {
-        "n_sections": int(n_sections),
-        "padlen_default": int(padlen_default),
-        "min_sequence_length": int(min_sequence_length),
-    }
-    
 def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     """
     Return (start, end, length) for each contiguous NaN gap in a 1D array.
@@ -503,7 +444,6 @@ def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
         ends = np.r_[ends, len(x)]
 
     return [(s, e, e - s) for s, e in zip(starts.tolist(), ends.tolist())]
-
 
 def interpolate_nan_gaps(
     data: np.ndarray,
@@ -570,6 +510,152 @@ def interpolate_nan_gaps(
     return result, nan_mask
 
 
+def apply_micro_interp(
+    signal: np.ndarray,
+    sampling_rate: int,
+    max_gap: int | None = None,
+    interp_method: str = "pchip"
+) -> np.ndarray:
+    """
+    Interpolate small NaN gaps in a 1D signal.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        1D input signal (may contain NaN).
+    sampling_rate : int
+        Sampling rate in Hz.
+    max_gap : int or None
+        Maximum gap size (samples) to interpolate. If None, uses
+        default_max_gap(sampling_rate).
+    interp_method : str
+        Interpolation method: "pchip" (default) or "cubic_spline".
+
+    Returns
+    -------
+    np.ndarray
+        Signal with small NaN gaps filled via interpolation.
+    """
+    signal = np.asarray(signal, dtype=float)
+
+    if max_gap is None:
+        max_gap = default_max_gap(sampling_rate)
+
+    filled, _nan_mask = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+    return filled
+
+
+def micro_interp_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    max_gap: int | None = None,
+    interp_method: str = "pchip"
+) -> None:
+    """
+    Interpolate small NaN gaps in all columns except 'time' in all CSV files.
+    Preserves folder structure from in_path to out_path.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path
+    out_path : str
+        Output directory path
+    sampling_rate : int
+        Sampling rate in Hz
+    max_gap : int, optional
+        Maximum gap size (samples) to interpolate. If None, uses
+        default_max_gap(sampling_rate).
+    interp_method : str, optional
+        Interpolation method: "pchip" (default) or "cubic_spline".
+    """
+    mapped_files = map_files(in_path, file_ext='csv')
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        for column in df.columns:
+            if column.lower() != 'time':
+                df[column] = apply_micro_interp(df[column].values, sampling_rate, max_gap, interp_method)
+
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+
+#
+# BANDPASS
+# =============================================================================
+#
+
+def apply_bandpass(data: list | tuple, sampling_rate: int, lowcut: float = 0.05, highcut: float = 2.0, order: int = 2) -> list | tuple:
+    """
+    Applies a zero-phase Butterworth bandpass filter.
+    Standard: 0.05-2.0 Hz for RIP belt data.
+    """
+    nyquist = 0.5 * sampling_rate
+    low = lowcut / nyquist
+    high = highcut / nyquist
+
+    # Design filter
+    sos = butter(order, [low, high], btype='band', output='sos')
+
+    # Apply zero-phase filter (filtfilt) with padlen adjusted for short signals
+    padlen = min(len(data) - 1, 15)
+    y = sosfiltfilt(sos, data, padlen=padlen)
+
+    return y
+
+
+def min_viable_length_sosfiltfilt(
+    sampling_rate: int,
+    lowcut: float = 0.05,
+    highcut: float = 2.0,
+    order: int = 2,
+) -> dict:
+    """
+    Compute the SciPy sosfiltfilt *default* padlen for a Butterworth bandpass and
+    return the minimum viable segment length N_min such that padlen < N-1.
+
+    Returns:
+        {
+          "n_sections": int,
+          "padlen_default": int,
+          "min_sequence_length": int
+        }
+    """
+    nyquist = 0.5 * sampling_rate
+    low = lowcut / nyquist
+    high = highcut / nyquist
+
+    sos = butter(order, [low, high], btype="band", output="sos")
+    n_sections = sos.shape[0]
+
+    # From SciPy docs for sosfiltfilt default padding length:
+    # padlen_default = 3 * (2*n_sections + 1 - min(z0, p0))
+    # where z0 is the number of zeros at the origin, p0 is the number of poles at the origin.
+    z0 = int(np.sum(sos[:, 2] == 0.0))  # b2 == 0 indicates a zero at z=0
+    p0 = int(np.sum(sos[:, 5] == 0.0))  # a2 == 0 indicates a pole at z=0
+    padlen_default = int(3 * (2 * n_sections + 1 - min(z0, p0)))
+
+    # sosfiltfilt requires padlen < N-1  =>  N >= padlen + 2
+    min_sequence_length = padlen_default + 2
+
+    return {
+        "n_sections": int(n_sections),
+        "padlen_default": int(padlen_default),
+        "min_sequence_length": int(min_sequence_length),
+    }
+
+
 def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
     """
     Return (start, end) index pairs for contiguous non-NaN regions ("islands")
@@ -614,19 +700,16 @@ def apply_bandpass_nan_safe(
     lowcut: float,
     highcut: float,
     order: int,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
 ) -> np.ndarray:
     """
-    NaN-safe bandpass filter using interpolation.
+    NaN-safe bandpass filter.
+
+    If the signal has no NaNs, filters directly. If NaNs remain (e.g. large
+    unfilled gaps), filters each contiguous non-NaN island separately.
 
     Parameters:
         data: Input signal (may contain NaN)
         sampling_rate, lowcut, highcut, order: Filter parameters
-        max_gap: Max gap size (samples) to interpolate. If None, interpolate all gaps.
-                 Gaps larger than max_gap remain as NaN in output.
-        interp_method: Specified interpolation method. Defaults to pchip.
-                 Alternatively user can specify "cubic_spline".
     """
     data = np.asarray(data, dtype=float)
 
@@ -634,26 +717,13 @@ def apply_bandpass_nan_safe(
     if not np.any(np.isnan(data)):
         return apply_bandpass(data, sampling_rate, lowcut, highcut, order)
 
-    # Interpolate gaps
-    interpolated, original_nan_mask = interpolate_nan_gaps(data, method=interp_method, max_gap=max_gap)
+    # NaNs present — filter each non-NaN island separately
+    min_len = min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
+    result = np.full_like(data, np.nan)
 
-    # Determine which NaNs were NOT filled (large gaps when max_gap is set)
-    still_nan = np.isnan(interpolated)
-
-    if np.any(still_nan):
-        # Some gaps weren't filled - filter valid segments only
-        min_len = min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
-        result = np.full_like(data, np.nan)
-
-        for start, end, segment in iter_nan_islands(interpolated):
-            if len(segment) >= min_len:
-                result[start:end] = apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
-    else:
-        # All gaps filled - filter entire signal
-        result = apply_bandpass(interpolated, sampling_rate, lowcut, highcut, order)
-
-    # Restore original NaN positions
-    # result[original_nan_mask] = np.nan
+    for start, end, segment in iter_nan_islands(data):
+        if len(segment) >= min_len:
+            result[start:end] = apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
 
     return result
 
@@ -666,8 +736,6 @@ def bandpass_filter_signals(
     sampling_rate: int,
     passband: str | tuple = 'default',
     order: int = 2,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
 ) -> None:
     """
     Applies a Butterworth bandpass filter to all columns except 'time' in all CSV files.
@@ -685,21 +753,10 @@ def bandpass_filter_signals(
         Preset name or tuple of (lowcut, highcut) in Hz.
         Presets: 'default' (0.05-2.0 Hz), 'resting_adult' (0.05-1.0 Hz),
         'narrow_band' (0.1-0.35 Hz), 'wide_band' (0.05-3.0 Hz).
-        Default: 'resting_adult'
+        Default: 'default'
     order : int, optional
         Filter order (default: 2)
-    max_gap : int, optional
-        Maximum gap size (in samples) to interpolate over. If None, uses
-        default_max_gap(sampling_rate) based on resting respiratory rate.
-        Gaps larger than max_gap remain as NaN in the output.
-    interp_method : Specified interpolation method. Defaults to pchip.
-        Alternatively user can specify "cubic_spline".
     """
-
-    # Apply physiological default if max_gap not specified
-    if max_gap is None:
-        max_gap = default_max_gap(sampling_rate)
-
     PASSBANDS = {
         'default': (0.05, 2.0),
         'resting_adult': (0.05, 1),
@@ -730,7 +787,7 @@ def bandpass_filter_signals(
         # Apply bandpass filter to all columns except 'time'
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_bandpass_nan_safe(df[column].values, sampling_rate, lowcut, highcut, order, max_gap, interp_method=interp_method)
+                df[column] = apply_bandpass_nan_safe(df[column].values, sampling_rate, lowcut, highcut, order)
 
         # Determine the relative path from in_path to preserve folder structure
         file_path_obj = Path(file_path)

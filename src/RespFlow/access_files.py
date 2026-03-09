@@ -48,12 +48,13 @@ def make_paths(root: str | None = None, raw: str | None = None) -> dict[str, str
         'raw':raw,
         'hard_fault':os.path.join(root, '2_hard_fault'),
         'detrend':os.path.join(root, '3_detrend'),
-        'bandpass':os.path.join(root, '4_bandpass'),
-        'fwr':os.path.join(root, '5_fwr'),
-        'screened':os.path.join(root, '6_screened'),
-        'filled':os.path.join(root, '7_filled'),
-        'smooth':os.path.join(root, '8_smoothed'),
-        'feature':os.path.join(root, '9_feature')
+        'micro_interp':os.path.join(root, '4_micro_interp'),
+        'bandpass':os.path.join(root, '5_bandpass'),
+        'fwr':os.path.join(root, '6_fwr'),
+        'screened':os.path.join(root, '7_screened'),
+        'filled':os.path.join(root, '8_filled'),
+        'smooth':os.path.join(root, '9_smoothed'),
+        'feature':os.path.join(root, '10_feature')
     }
     
     # Create folders
