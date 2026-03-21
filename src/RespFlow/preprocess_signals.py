@@ -3,6 +3,7 @@ from scipy.signal import butter, sosfiltfilt
 import pandas as pd
 from pathlib import Path
 from scipy.ndimage import median_filter
+from scipy.ndimage import binary_closing
 import numpy as np
 from dataclasses import dataclass
 
@@ -388,7 +389,8 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
             if column.lower() != 'time':
                 detrended_signal, baseline = apply_detrend(df[column].values, sampling_rate, window_size_seconds)
                 df[column] = detrended_signal
-                df[f"{column}_baseline"] = baseline
+                # Commented out for now. Don't need to keep track of this.
+                # df[f"{column}_baseline"] = baseline 
 
         # Determine the relative path from in_path to preserve folder structure
         file_path_obj = Path(file_path)
@@ -414,14 +416,14 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
 RESTING_RR_HZ = 0.25  # 0.25 Hz ≈ 15 breaths/min (upper bound for resting adults)
 
 
-def default_max_gap(sampling_rate: int, resting_rate: float = RESTING_RR_HZ) -> int:
+def default_max_gap(sampling_rate: int, percentage_fill = 0.3, resting_rate: float = RESTING_RR_HZ) -> int:
     """
     Compute a default max_gap (in samples) for NaN micro gap interpolation.
 
     Rule: 30% of one respiratory cycle length.
     At 2000 Hz, 0.25 Hz: 0.3 * (2000 / 0.25) = 2400 samples.
     """
-    return int(round(0.3 * sampling_rate / resting_rate))
+    return int(round(percentage_fill * sampling_rate / resting_rate))
 
 def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     """
@@ -805,9 +807,104 @@ def bandpass_filter_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# ANOMALY DETECTION
 # =============================================================================
 #
 
+def detect_anomalies_iqr(signal_series, window_size=60_000):
+    # Calculate rolling Q1 (25th percentile) and Q3 (75th percentile)
+    rolling_q1 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.25)
+    rolling_q3 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.75)
+    
+    # Calculate rolling IQR
+    rolling_iqr = rolling_q3 - rolling_q1
+    
+    # Define dynamic upper and lower bounds
+    lower_bound = rolling_q1 - (1.5 * rolling_iqr)
+    upper_bound = rolling_q3 + (1.5 * rolling_iqr)
+    
+    # Flag points outside the bounds
+    anomalies = (signal_series < lower_bound) | (signal_series > upper_bound)
+    
+    # Fill NaN values created by the rolling window at the edges
+    return anomalies.fillna(False)
+
+
+def detect_anomalies_zscore(signal_series, window_size=60_000, z_threshold=2.0):
+    # Calculate rolling mean and standard deviation
+    rolling_mean = signal_series.rolling(window=window_size, center=True, min_periods=1).mean()
+    rolling_std = signal_series.rolling(window=window_size, center=True, min_periods=1).std()
+    
+    # Calculate the Z-score for each point
+    z_scores = (signal_series - rolling_mean) / rolling_std
+    
+    # Flag points where the absolute Z-score exceeds the threshold
+    anomalies = np.abs(z_scores) > z_threshold
+    
+    # Fill NaN values at the edges
+    return anomalies.fillna(False)
+
+
+def detect_anomalies_energy_ratio(signal_series, short_window=8_000, long_window=60_000,
+                                   upper_ratio=3.0, lower_ratio=0.1):
+    """
+    Flags regions where local energy deviates from the longer-term baseline.
+
+    Compares short-term rolling variance to long-term rolling variance.
+    ratio >> 1  →  local burst  (motion, cough, artifact)
+    ratio << 1  →  local quiescence  (apnea, signal dropout)
+
+    Parameters
+    ----------
+    signal_series : pd.Series
+    short_window : int
+        Short-term variance window in samples.  Must span at least ~2 breath
+        cycles so that normal sinusoidal oscillation averages out.
+        Default 8000 = 4 s at 2000 Hz (~2 breaths at 0.25 Hz).
+    long_window : int
+        Long-term variance window in samples (default 60000 = 30 s at 2000 Hz).
+    upper_ratio : float
+        Flag where ratio exceeds this (energy burst). Default 3.0.
+    lower_ratio : float
+        Flag where ratio falls below this (energy drop). Default 0.1.
+    """
+    short_var = signal_series.rolling(window=short_window, center=True, min_periods=1).var()
+    long_var = signal_series.rolling(window=long_window, center=True, min_periods=1).var()
+
+    # Avoid division by zero — where long_var is ~0 the signal is essentially
+    # flatlined, which is itself anomalous
+    ratio = short_var / long_var.replace(0, np.nan)
+
+    anomalies = (ratio > upper_ratio) | (ratio < lower_ratio)
+    return anomalies.fillna(False)
+
+
+def detect_anomalies_ensemble(signal_series, window_size=60_000, min_votes=2):
+    """
+    Combines IQR, Z-Score, and Energy-Ratio methods to find anomalies.
+    Requires at least 'min_votes' methods to flag a point as True.
+    """
+    iqr_flags = detect_anomalies_iqr(signal_series, window_size=window_size)
+    zscore_flags = detect_anomalies_zscore(signal_series, window_size=window_size)
+    energy_flags = detect_anomalies_energy_ratio(signal_series, long_window=window_size)
+
+    total_votes = iqr_flags.astype(int) + zscore_flags.astype(int) + energy_flags.astype(int)
+
+    ensemble_anomalies = total_votes >= min_votes
+    return ensemble_anomalies   
+
+def merge_close_anomalies(anomaly_mask, max_gap_samples=6000):
+    """
+    Merges anomaly blocks that are separated by fewer than 'max_gap_samples'.
+    """
+    # Create a structural element of ones (the size of the allowed gap)
+    structure = np.ones(max_gap_samples)
+    
+    # Run the closing operation
+    # It will turn [True, False, False, True] into [True, True, True, True]
+    merged_mask = binary_closing(anomaly_mask, structure=structure)
+    
+    return merged_mask
 #
 # =============================================================================
 #
