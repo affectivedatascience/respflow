@@ -899,12 +899,121 @@ def merge_close_anomalies(anomaly_mask, max_gap_samples=6000):
     """
     # Create a structural element of ones (the size of the allowed gap)
     structure = np.ones(max_gap_samples)
-    
+
     # Run the closing operation
     # It will turn [True, False, False, True] into [True, True, True, True]
     merged_mask = binary_closing(anomaly_mask, structure=structure)
-    
+
     return merged_mask
+
+
+def pad_anomaly_mask(anomaly_mask, pad_factor=2.0):
+    """
+    Expands each contiguous anomaly region by a fraction of its own length.
+
+    For each block of True values of length L, adds (pad_factor * L / 2)
+    samples on each side, clamped to the array bounds.
+
+    Parameters
+    ----------
+    anomaly_mask : array-like of bool
+        Boolean mask where True indicates an anomalous sample.
+    pad_factor : float
+        Total padding as a multiple of the anomaly length, split equally
+        between both sides. Default 2.0 means each side gets 1x the anomaly
+        length (so the padded region is 3x the original).
+
+    Returns
+    -------
+    padded : np.ndarray of bool
+    """
+    mask = np.asarray(anomaly_mask, dtype=bool)
+    padded = mask.copy()
+    n = len(mask)
+
+    # Find starts and ends of contiguous True runs
+    diff = np.diff(np.concatenate(([False], mask, [False])).astype(int))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+
+    for start, end in zip(starts, ends):
+        length = end - start
+        pad = int(length * pad_factor / 2)
+        padded[max(0, start - pad): min(n, end + pad)] = True
+
+    return padded
+
+
+def detect_anomalies(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    window_size_seconds: float = 30,
+    min_votes: int = 2,
+    merge_gap_seconds: float = 0,
+    pad_factor: float = 2.0,
+) -> None:
+    """
+    Detects anomalies using an ensemble of IQR, Z-Score, and Energy-Ratio
+    methods, and replaces flagged points with NaN.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path containing CSV files.
+    out_path : str
+        Output directory path for anomaly-screened CSV files.
+    sampling_rate : int
+        Sampling rate in Hz.
+    window_size_seconds : float, optional
+        Rolling window size in seconds for detection methods (default: 30).
+    min_votes : int, optional
+        Minimum number of methods that must flag a point (default: 2).
+    merge_gap_seconds : float, optional
+        Maximum gap in seconds between anomaly blocks to merge (default: 0, no merging).
+    pad_factor : float, optional
+        Padding around each anomaly as a multiple of its length, split equally
+        on both sides. Default 2.0 means each side is padded by 1x the anomaly
+        length. Set to 0 to disable padding.
+    """
+    window_samples = int(window_size_seconds * sampling_rate)
+    merge_gap_samples = int(merge_gap_seconds * sampling_rate)
+
+    mapped_files = map_files(in_path, file_ext='csv')
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        for column in df.columns:
+            if column.lower() != 'time':
+                mask = detect_anomalies_ensemble(
+                    df[column],
+                    window_size=window_samples,
+                    min_votes=min_votes,
+                )
+
+                if merge_gap_samples > 0:
+                    mask = merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
+
+                if pad_factor > 0:
+                    mask = pad_anomaly_mask(mask, pad_factor=pad_factor)
+
+                df[f'{column}_anomaly'] = mask
+                df.loc[mask, column] = np.nan
+
+        # Preserve folder structure
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+
 #
 # =============================================================================
 #
