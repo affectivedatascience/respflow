@@ -495,6 +495,15 @@ def interpolate_nan_gaps(
     if len(valid_idx) < 2:
         return result, nan_mask  # Can't interpolate with < 2 points
 
+    # Anchor edge gaps to 0 so the interpolator ramps smoothly
+    # instead of extrapolating wildly.
+    if valid_idx[0] != 0 and fill_mask[0]:
+        valid_idx = np.insert(valid_idx, 0, 0)
+        valid_vals = np.insert(valid_vals, 0, 0.0)
+    if valid_idx[-1] != len(data) - 1 and fill_mask[-1]:
+        valid_idx = np.append(valid_idx, len(data) - 1)
+        valid_vals = np.append(valid_vals, 0.0)
+
     # Create interpolator defaulting to pchip
     if method == "pchip":
         interp = PchipInterpolator(valid_idx, valid_vals)
