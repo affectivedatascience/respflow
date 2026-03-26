@@ -41,8 +41,8 @@ def test_make_paths_defaults(mock_filesystem):
     paths = make_paths()
 
     expected_keys = {
-        'raw', 'hard_fault', 'detrend', 'micro_interp', 'bandpass', 'fwr',
-        'screened', 'filled', 'smooth', 'feature'
+        'raw', 'hard_fault', 'micro_interp', 'detrend', 'bandpass', 'anomaly',
+        'post_anomaly_interp', 'impute_anomaly', 'smooth', 'feature'
     }
     
     # Assert all expected keys are present
@@ -66,8 +66,8 @@ def test_make_paths_custom_root_raw(mock_filesystem):
     assert paths['raw'] == "/abs/my_raw"
 
     # Assert other folders should be based on custom root
-    assert paths['detrend'] == "/abs/my_root/3_detrend"
-    assert paths['micro_interp'] == "/abs/my_root/4_micro_interp"
+    assert paths['micro_interp'] == "/abs/my_root/3_micro_interp"
+    assert paths['detrend'] == "/abs/my_root/4_detrend"
     assert paths['bandpass'] == "/abs/my_root/5_bandpass"
 
     # Assert makedirs was called for every path

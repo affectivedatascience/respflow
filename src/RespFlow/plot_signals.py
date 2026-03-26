@@ -21,7 +21,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
     
 
     # Define all processing stages in order
-    stages = ['raw', 'hard_fault', 'detrend', 'micro_interp', 'bandpass', 'fwr', 'screened', 'filled', 'smooth', 'feature']
+    stages = ['raw', 'hard_fault', 'micro_interp', 'detrend', 'bandpass', 'anomaly', 'post_anomaly_interp', 'impute_anomaly', 'smooth', 'feature']
 
     app = Dash()
 
@@ -116,9 +116,10 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
             color = viridis_colors[idx % len(viridis_colors)]
 
             # Data trace - blank gaps where NaN
+            # Looks for column in file with label 'Respiration'
             fig.add_trace(go.Scattergl(
                 x=df[df.columns[0]],
-                y=df[df.columns[1]],
+                y=df['Respiration'],
                 mode='lines',
                 name=stage,
                 line=dict(color=color, width=1.5),

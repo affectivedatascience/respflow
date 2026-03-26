@@ -3,6 +3,7 @@ from scipy.signal import butter, sosfiltfilt
 import pandas as pd
 from pathlib import Path
 from scipy.ndimage import median_filter
+from scipy.ndimage import binary_closing
 import numpy as np
 from dataclasses import dataclass
 
@@ -388,7 +389,8 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
             if column.lower() != 'time':
                 detrended_signal, baseline = apply_detrend(df[column].values, sampling_rate, window_size_seconds)
                 df[column] = detrended_signal
-                df[f"{column}_baseline"] = baseline
+                # Commented out for now. Don't need to keep track of this.
+                # df[f"{column}_baseline"] = baseline 
 
         # Determine the relative path from in_path to preserve folder structure
         file_path_obj = Path(file_path)
@@ -414,14 +416,14 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
 RESTING_RR_HZ = 0.25  # 0.25 Hz ≈ 15 breaths/min (upper bound for resting adults)
 
 
-def default_max_gap(sampling_rate: int, resting_rate: float = RESTING_RR_HZ) -> int:
+def default_max_gap(sampling_rate: int, percentage_fill = 0.3, resting_rate: float = RESTING_RR_HZ) -> int:
     """
     Compute a default max_gap (in samples) for NaN micro gap interpolation.
 
     Rule: 30% of one respiratory cycle length.
     At 2000 Hz, 0.25 Hz: 0.3 * (2000 / 0.25) = 2400 samples.
     """
-    return int(round(0.3 * sampling_rate / resting_rate))
+    return int(round(percentage_fill * sampling_rate / resting_rate))
 
 def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     """
@@ -493,6 +495,15 @@ def interpolate_nan_gaps(
     if len(valid_idx) < 2:
         return result, nan_mask  # Can't interpolate with < 2 points
 
+    # Anchor edge gaps to 0 so the interpolator ramps smoothly
+    # instead of extrapolating wildly.
+    if valid_idx[0] != 0 and fill_mask[0]:
+        valid_idx = np.insert(valid_idx, 0, 0)
+        valid_vals = np.insert(valid_vals, 0, 0.0)
+    if valid_idx[-1] != len(data) - 1 and fill_mask[-1]:
+        valid_idx = np.append(valid_idx, len(data) - 1)
+        valid_vals = np.append(valid_vals, 0.0)
+
     # Create interpolator defaulting to pchip
     if method == "pchip":
         interp = PchipInterpolator(valid_idx, valid_vals)
@@ -513,8 +524,8 @@ def interpolate_nan_gaps(
 def apply_micro_interp(
     signal: np.ndarray,
     sampling_rate: int,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
+    interp_method: str = "pchip",
+    percentage_fill: float = 0.3
 ) -> np.ndarray:
     """
     Interpolate small NaN gaps in a 1D signal.
@@ -525,11 +536,10 @@ def apply_micro_interp(
         1D input signal (may contain NaN).
     sampling_rate : int
         Sampling rate in Hz.
-    max_gap : int or None
-        Maximum gap size (samples) to interpolate. If None, uses
-        default_max_gap(sampling_rate).
     interp_method : str
         Interpolation method: "pchip" (default) or "cubic_spline".
+    percentage_fill : float
+        Fraction of one breath cycle to fill. Default 0.3 (30%).
 
     Returns
     -------
@@ -537,10 +547,7 @@ def apply_micro_interp(
         Signal with small NaN gaps filled via interpolation.
     """
     signal = np.asarray(signal, dtype=float)
-
-    if max_gap is None:
-        max_gap = default_max_gap(sampling_rate)
-
+    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill)
     filled, _nan_mask = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
     return filled
 
@@ -549,8 +556,8 @@ def micro_interp_signals(
     in_path: str,
     out_path: str,
     sampling_rate: int,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
+    interp_method: str = "pchip",
+    percentage_fill: float = 0.3
 ) -> None:
     """
     Interpolate small NaN gaps in all columns except 'time' in all CSV files.
@@ -564,11 +571,10 @@ def micro_interp_signals(
         Output directory path
     sampling_rate : int
         Sampling rate in Hz
-    max_gap : int, optional
-        Maximum gap size (samples) to interpolate. If None, uses
-        default_max_gap(sampling_rate).
     interp_method : str, optional
         Interpolation method: "pchip" (default) or "cubic_spline".
+    percentage_fill : float, optional
+        Fraction of one breath cycle to fill. Default 0.3 (30%).
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -580,7 +586,7 @@ def micro_interp_signals(
 
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_micro_interp(df[column].values, sampling_rate, max_gap, interp_method)
+                df[column] = apply_micro_interp(df[column].values, sampling_rate, interp_method, percentage_fill)
 
         file_path_obj = Path(file_path)
         relative_path = file_path_obj.relative_to(in_path_obj)
@@ -805,10 +811,293 @@ def bandpass_filter_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# ANOMALY DETECTION
 # =============================================================================
 #
+
+def detect_anomalies_iqr(signal_series, window_size=60_000):
+    # Calculate rolling Q1 (25th percentile) and Q3 (75th percentile)
+    rolling_q1 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.25)
+    rolling_q3 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.75)
+    
+    # Calculate rolling IQR
+    rolling_iqr = rolling_q3 - rolling_q1
+    
+    # Define dynamic upper and lower bounds
+    lower_bound = rolling_q1 - (1.5 * rolling_iqr)
+    upper_bound = rolling_q3 + (1.5 * rolling_iqr)
+    
+    # Flag points outside the bounds
+    anomalies = (signal_series < lower_bound) | (signal_series > upper_bound)
+    
+    # Fill NaN values created by the rolling window at the edges
+    return anomalies.fillna(False)
+
+
+def detect_anomalies_zscore(signal_series, window_size=60_000, z_threshold=2.0):
+    # Calculate rolling mean and standard deviation
+    rolling_mean = signal_series.rolling(window=window_size, center=True, min_periods=1).mean()
+    rolling_std = signal_series.rolling(window=window_size, center=True, min_periods=1).std()
+    
+    # Calculate the Z-score for each point
+    z_scores = (signal_series - rolling_mean) / rolling_std
+    
+    # Flag points where the absolute Z-score exceeds the threshold
+    anomalies = np.abs(z_scores) > z_threshold
+    
+    # Fill NaN values at the edges
+    return anomalies.fillna(False)
+
+
+def detect_anomalies_energy_ratio(signal_series, short_window=8_000, long_window=60_000,
+                                   upper_ratio=3.0, lower_ratio=0.1):
+    """
+    Flags regions where local energy deviates from the longer-term baseline.
+
+    Compares short-term rolling variance to long-term rolling variance.
+    ratio >> 1  →  local burst  (motion, cough, artifact)
+    ratio << 1  →  local quiescence  (apnea, signal dropout)
+
+    Parameters
+    ----------
+    signal_series : pd.Series
+    short_window : int
+        Short-term variance window in samples.  Must span at least ~2 breath
+        cycles so that normal sinusoidal oscillation averages out.
+        Default 8000 = 4 s at 2000 Hz (~2 breaths at 0.25 Hz).
+    long_window : int
+        Long-term variance window in samples (default 60000 = 30 s at 2000 Hz).
+    upper_ratio : float
+        Flag where ratio exceeds this (energy burst). Default 3.0.
+    lower_ratio : float
+        Flag where ratio falls below this (energy drop). Default 0.1.
+    """
+    short_var = signal_series.rolling(window=short_window, center=True, min_periods=1).var()
+    long_var = signal_series.rolling(window=long_window, center=True, min_periods=1).var()
+
+    # Avoid division by zero — where long_var is ~0 the signal is essentially
+    # flatlined, which is itself anomalous
+    ratio = short_var / long_var.replace(0, np.nan)
+
+    anomalies = (ratio > upper_ratio) | (ratio < lower_ratio)
+    return anomalies.fillna(False)
+
+
+def detect_anomalies_ensemble(signal_series, window_size=60_000, min_votes=2):
+    """
+    Combines IQR, Z-Score, and Energy-Ratio methods to find anomalies.
+    Requires at least 'min_votes' methods to flag a point as True.
+    """
+    iqr_flags = detect_anomalies_iqr(signal_series, window_size=window_size)
+    zscore_flags = detect_anomalies_zscore(signal_series, window_size=window_size)
+    energy_flags = detect_anomalies_energy_ratio(signal_series, long_window=window_size)
+
+    total_votes = iqr_flags.astype(int) + zscore_flags.astype(int) + energy_flags.astype(int)
+
+    ensemble_anomalies = total_votes >= min_votes
+    return ensemble_anomalies   
+
+def merge_close_anomalies(anomaly_mask, max_gap_samples=6000):
+    """
+    Merges anomaly blocks that are separated by fewer than 'max_gap_samples'.
+    """
+    # Create a structural element of ones (the size of the allowed gap)
+    structure = np.ones(max_gap_samples)
+
+    # Run the closing operation
+    # It will turn [True, False, False, True] into [True, True, True, True]
+    merged_mask = binary_closing(anomaly_mask, structure=structure)
+
+    return merged_mask
+
+
+def pad_anomaly_mask(anomaly_mask, pad_factor=2.0):
+    """
+    Expands each contiguous anomaly region by a fraction of its own length.
+
+    For each block of True values of length L, adds (pad_factor * L / 2)
+    samples on each side, clamped to the array bounds.
+
+    Parameters
+    ----------
+    anomaly_mask : array-like of bool
+        Boolean mask where True indicates an anomalous sample.
+    pad_factor : float
+        Total padding as a multiple of the anomaly length, split equally
+        between both sides. Default 2.0 means each side gets 1x the anomaly
+        length (so the padded region is 3x the original).
+
+    Returns
+    -------
+    padded : np.ndarray of bool
+    """
+    mask = np.asarray(anomaly_mask, dtype=bool)
+    padded = mask.copy()
+    n = len(mask)
+
+    # Find starts and ends of contiguous True runs
+    diff = np.diff(np.concatenate(([False], mask, [False])).astype(int))
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0]
+
+    for start, end in zip(starts, ends):
+        length = end - start
+        pad = int(length * pad_factor / 2)
+        padded[max(0, start - pad): min(n, end + pad)] = True
+
+    return padded
+
+
+def detect_anomalies(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    window_size_seconds: float = 30,
+    min_votes: int = 2,
+    merge_gap_seconds: float = 0,
+    pad_factor: float = 2.0,
+) -> None:
+    """
+    Detects anomalies using an ensemble of IQR, Z-Score, and Energy-Ratio
+    methods, and replaces flagged points with NaN.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path containing CSV files.
+    out_path : str
+        Output directory path for anomaly-screened CSV files.
+    sampling_rate : int
+        Sampling rate in Hz.
+    window_size_seconds : float, optional
+        Rolling window size in seconds for detection methods (default: 30).
+    min_votes : int, optional
+        Minimum number of methods that must flag a point (default: 2).
+    merge_gap_seconds : float, optional
+        Maximum gap in seconds between anomaly blocks to merge (default: 0, no merging).
+    pad_factor : float, optional
+        Padding around each anomaly as a multiple of its length, split equally
+        on both sides. Default 2.0 means each side is padded by 1x the anomaly
+        length. Set to 0 to disable padding.
+    """
+    window_samples = int(window_size_seconds * sampling_rate)
+    merge_gap_samples = int(merge_gap_seconds * sampling_rate)
+
+    mapped_files = map_files(in_path, file_ext='csv')
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        for column in df.columns:
+            if column.lower() != 'time':
+                mask = detect_anomalies_ensemble(
+                    df[column],
+                    window_size=window_samples,
+                    min_votes=min_votes,
+                )
+
+                if merge_gap_samples > 0:
+                    mask = merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
+
+                if pad_factor > 0:
+                    mask = pad_anomaly_mask(mask, pad_factor=pad_factor)
+
+                df[f'{column}_anomaly'] = mask
+                df.loc[mask, column] = np.nan
+
+        # Preserve folder structure
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+
+#
+# POST ANOMALY MICRO INTERP
+# =============================================================================
+#
+
+def post_anomaly_interp_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    interp_method: str = "pchip",
+    percentage_fill: float = 0.5
+) -> None:
+    """
+    Post-anomaly interpolation: fills larger NaN gaps (default 50% of one
+    breath cycle) after anomaly detection has NaN-ed out bad regions.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path (typically the anomaly output).
+    out_path : str
+        Output directory path.
+    sampling_rate : int
+        Sampling rate in Hz.
+    interp_method : str, optional
+        Interpolation method: "pchip" (default) or "cubic_spline".
+    percentage_fill : float, optional
+        Fraction of one breath cycle to fill. Default 0.5 (50%).
+    """
+    mapped_files = map_files(in_path, file_ext='csv')
+    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill)
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        data_columns = [
+            c for c in df.columns
+            if c.lower() != 'time' and not c.endswith('_anomaly')
+        ]
+
+        for column in data_columns:
+            anomaly_col = f'{column}_anomaly'
+            if anomaly_col not in df.columns:
+                continue
+
+            signal = df[column].values.copy()
+            anomaly_mask = df[anomaly_col].values.astype(bool)
+            nan_mask = np.isnan(signal)
+            non_anomaly_nans = nan_mask & ~anomaly_mask
+
+            # Temporarily fill non-anomaly NaNs via linear interp so they
+            # don't distort the curve but aren't seen as gaps.
+            if np.any(non_anomaly_nans):
+                valid = np.where(~nan_mask)[0]
+                if len(valid) >= 2:
+                    signal[non_anomaly_nans] = np.interp(
+                        np.where(non_anomaly_nans)[0], valid, signal[valid]
+                    )
+
+            filled, _ = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+
+            # Restore non-anomaly NaNs
+            filled[non_anomaly_nans] = np.nan
+            df[column] = filled
+
+        # Drop anomaly mask columns
+        anomaly_cols = [c for c in df.columns if c.endswith('_anomaly')]
+        df.drop(columns=anomaly_cols, inplace=True)
+
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
 # =============================================================================
 #
-
