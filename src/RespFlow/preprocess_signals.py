@@ -495,6 +495,15 @@ def interpolate_nan_gaps(
     if len(valid_idx) < 2:
         return result, nan_mask  # Can't interpolate with < 2 points
 
+    # Anchor edge gaps to 0 so the interpolator ramps smoothly
+    # instead of extrapolating wildly.
+    if valid_idx[0] != 0 and fill_mask[0]:
+        valid_idx = np.insert(valid_idx, 0, 0)
+        valid_vals = np.insert(valid_vals, 0, 0.0)
+    if valid_idx[-1] != len(data) - 1 and fill_mask[-1]:
+        valid_idx = np.append(valid_idx, len(data) - 1)
+        valid_vals = np.append(valid_vals, 0.0)
+
     # Create interpolator defaulting to pchip
     if method == "pchip":
         interp = PchipInterpolator(valid_idx, valid_vals)
@@ -515,8 +524,8 @@ def interpolate_nan_gaps(
 def apply_micro_interp(
     signal: np.ndarray,
     sampling_rate: int,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
+    interp_method: str = "pchip",
+    percentage_fill: float = 0.3
 ) -> np.ndarray:
     """
     Interpolate small NaN gaps in a 1D signal.
@@ -527,11 +536,10 @@ def apply_micro_interp(
         1D input signal (may contain NaN).
     sampling_rate : int
         Sampling rate in Hz.
-    max_gap : int or None
-        Maximum gap size (samples) to interpolate. If None, uses
-        default_max_gap(sampling_rate).
     interp_method : str
         Interpolation method: "pchip" (default) or "cubic_spline".
+    percentage_fill : float
+        Fraction of one breath cycle to fill. Default 0.3 (30%).
 
     Returns
     -------
@@ -539,10 +547,7 @@ def apply_micro_interp(
         Signal with small NaN gaps filled via interpolation.
     """
     signal = np.asarray(signal, dtype=float)
-
-    if max_gap is None:
-        max_gap = default_max_gap(sampling_rate)
-
+    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill)
     filled, _nan_mask = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
     return filled
 
@@ -551,8 +556,8 @@ def micro_interp_signals(
     in_path: str,
     out_path: str,
     sampling_rate: int,
-    max_gap: int | None = None,
-    interp_method: str = "pchip"
+    interp_method: str = "pchip",
+    percentage_fill: float = 0.3
 ) -> None:
     """
     Interpolate small NaN gaps in all columns except 'time' in all CSV files.
@@ -566,11 +571,10 @@ def micro_interp_signals(
         Output directory path
     sampling_rate : int
         Sampling rate in Hz
-    max_gap : int, optional
-        Maximum gap size (samples) to interpolate. If None, uses
-        default_max_gap(sampling_rate).
     interp_method : str, optional
         Interpolation method: "pchip" (default) or "cubic_spline".
+    percentage_fill : float, optional
+        Fraction of one breath cycle to fill. Default 0.3 (30%).
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -582,7 +586,7 @@ def micro_interp_signals(
 
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_micro_interp(df[column].values, sampling_rate, max_gap, interp_method)
+                df[column] = apply_micro_interp(df[column].values, sampling_rate, interp_method, percentage_fill)
 
         file_path_obj = Path(file_path)
         relative_path = file_path_obj.relative_to(in_path_obj)
@@ -1015,6 +1019,85 @@ def detect_anomalies(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# POST ANOMALY MICRO INTERP
 # =============================================================================
 #
 
+def post_anomaly_interp_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    interp_method: str = "pchip",
+    percentage_fill: float = 0.5
+) -> None:
+    """
+    Post-anomaly interpolation: fills larger NaN gaps (default 50% of one
+    breath cycle) after anomaly detection has NaN-ed out bad regions.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path (typically the anomaly output).
+    out_path : str
+        Output directory path.
+    sampling_rate : int
+        Sampling rate in Hz.
+    interp_method : str, optional
+        Interpolation method: "pchip" (default) or "cubic_spline".
+    percentage_fill : float, optional
+        Fraction of one breath cycle to fill. Default 0.5 (50%).
+    """
+    mapped_files = map_files(in_path, file_ext='csv')
+    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill)
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        data_columns = [
+            c for c in df.columns
+            if c.lower() != 'time' and not c.endswith('_anomaly')
+        ]
+
+        for column in data_columns:
+            anomaly_col = f'{column}_anomaly'
+            if anomaly_col not in df.columns:
+                continue
+
+            signal = df[column].values.copy()
+            anomaly_mask = df[anomaly_col].values.astype(bool)
+            nan_mask = np.isnan(signal)
+            non_anomaly_nans = nan_mask & ~anomaly_mask
+
+            # Temporarily fill non-anomaly NaNs via linear interp so they
+            # don't distort the curve but aren't seen as gaps.
+            if np.any(non_anomaly_nans):
+                valid = np.where(~nan_mask)[0]
+                if len(valid) >= 2:
+                    signal[non_anomaly_nans] = np.interp(
+                        np.where(non_anomaly_nans)[0], valid, signal[valid]
+                    )
+
+            filled, _ = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+
+            # Restore non-anomaly NaNs
+            filled[non_anomaly_nans] = np.nan
+            df[column] = filled
+
+        # Drop anomaly mask columns
+        anomaly_cols = [c for c in df.columns if c.endswith('_anomaly')]
+        df.drop(columns=anomaly_cols, inplace=True)
+
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+
+#
+# =============================================================================
+#
