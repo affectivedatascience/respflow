@@ -280,9 +280,10 @@ def hard_fault_signals(
     out_path: str,
     sampling_rate: int,
     config: HardFaultConfig | None = None,
+    columns: list[str] | None = None,
 ) -> None:
     """
-    Applies hard-fault detection to all columns except 'time' in all CSV files.
+    Applies hard-fault detection to selected columns in all CSV files.
     Preserves folder structure from in_path to out_path.
 
     Parameters
@@ -295,7 +296,13 @@ def hard_fault_signals(
         Sampling rate in Hz
     config : HardFaultConfig, optional
         Detection configuration. Uses defaults if None.
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column)
+        will be kept in the output. Defaults to ['Respiration'].
     """
+    if columns is None:
+        columns = ['Respiration']
+
     mapped_files = map_files(in_path, file_ext='csv')
 
     in_path_obj = Path(in_path)
@@ -303,6 +310,21 @@ def hard_fault_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+
+        # Find the time column (case-insensitive)
+        time_col = next((c for c in df.columns if c.lower() == 'time'), None)
+
+        # Validate requested columns exist
+        missing = [c for c in columns if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Columns {missing} not found in {file_path}. "
+                f"Available: {list(df.columns)}"
+            )
+
+        # Filter to time + requested columns
+        keep = ([time_col] if time_col else []) + columns
+        df = df[keep]
 
         df2 = apply_hard_fault_to_df(df, sampling_rate, config=config)
 
@@ -387,10 +409,8 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
         # Apply detrending to all columns except 'time'
         for column in df.columns:
             if column.lower() != 'time':
-                detrended_signal, baseline = apply_detrend(df[column].values, sampling_rate, window_size_seconds)
+                detrended_signal, _ = apply_detrend(df[column].values, sampling_rate, window_size_seconds)
                 df[column] = detrended_signal
-                # Commented out for now. Don't need to keep track of this.
-                # df[f"{column}_baseline"] = baseline 
 
         # Determine the relative path from in_path to preserve folder structure
         file_path_obj = Path(file_path)
