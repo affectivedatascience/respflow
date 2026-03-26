@@ -7,6 +7,11 @@ from scipy.ndimage import binary_closing
 import numpy as np
 from dataclasses import dataclass
 
+
+def _seconds_to_samples(seconds: float, fs: float) -> int:
+    """Convert a duration in seconds to the nearest whole number of samples."""
+    return int(round(seconds * fs))
+
 #
 # =============================================================================
 #
@@ -150,7 +155,7 @@ def apply_hard_fault(
     dx_abs = np.abs(dx)
     mask_dx_small = (dx_abs <= flat_eps) & ~np.isnan(dx)
 
-    min_flat_samples = int(np.ceil(config.flat_min_s * fs))
+    min_flat_samples = _seconds_to_samples(config.flat_min_s, fs)
     mask_flatline = np.zeros(N, dtype=bool)
 
     # A run of small dx from [a, b) implies constant samples [a, b+1)
@@ -170,7 +175,7 @@ def apply_hard_fault(
     clip_tol = 0.01 * mad_x
 
     mask_clip_raw = (~mask_nan) & ((x <= rail_low + clip_tol) | (x >= rail_high - clip_tol))
-    min_clip_samples = int(np.ceil(config.clip_min_run_s * fs))
+    min_clip_samples = _seconds_to_samples(config.clip_min_run_s, fs)
     mask_clip = _apply_min_run_length(mask_clip_raw, min_clip_samples)
 
     # -------------------------------------------------------------------------
@@ -184,9 +189,9 @@ def apply_hard_fault(
 
     step_candidates = np.where(np.abs(dx - dx_med) > step_threshold)[0]
     mask_step = np.zeros(N, dtype=bool)
-    step_pad = int(np.ceil(config.step_pad_s * fs))
+    step_pad = _seconds_to_samples(config.step_pad_s, fs)
 
-    verify_win = int(np.ceil(config.step_verify_window_s * fs))
+    verify_win = _seconds_to_samples(config.step_verify_window_s, fs)
     min_shift = 0.3 * mad_x
     # Massive spikes (3x threshold) bypass verification
     spike_bypass_thr = 3.0 * step_threshold
@@ -229,7 +234,7 @@ def apply_hard_fault(
     mask_hardfault = mask_nan | mask_flatline | mask_clip | mask_step
 
     if config.fault_pad_s and config.fault_pad_s > 0:
-        fault_pad = int(np.ceil(config.fault_pad_s * fs))
+        fault_pad = _seconds_to_samples(config.fault_pad_s, fs)
         mask_hardfault = _dilate_mask(mask_hardfault, fault_pad)
 
     x[mask_hardfault] = np.nan
@@ -353,7 +358,7 @@ def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds:
     use_rolling = (signal_duration >= W0)
 
     if use_rolling:
-        k = int(round(W0 * sampling_rate))  # window length in samples
+        k = _seconds_to_samples(W0, sampling_rate)  # window length in samples
         if k % 2 == 0:
             k += 1
 
@@ -432,18 +437,23 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
 # =============================================================================
 #
 
-# Physiological constant: typical resting respiratory rate
-RESTING_RR_HZ = 0.25  # 0.25 Hz ≈ 15 breaths/min (upper bound for resting adults)
-
-
-def default_max_gap(sampling_rate: int, percentage_fill = 0.3, resting_rate: float = RESTING_RR_HZ) -> int:
+def default_max_gap(sampling_rate: int, percentage_fill: float = 0.3, breath_rate_hz: float = 0.25) -> int:
     """
     Compute a default max_gap (in samples) for NaN micro gap interpolation.
 
-    Rule: 30% of one respiratory cycle length.
+    Rule: percentage_fill of one respiratory cycle length.
     At 2000 Hz, 0.25 Hz: 0.3 * (2000 / 0.25) = 2400 samples.
+
+    Parameters
+    ----------
+    sampling_rate : int
+        Sampling rate in Hz.
+    percentage_fill : float
+        Fraction of one breath cycle to fill. Default 0.3 (30%).
+    breath_rate_hz : float
+        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
     """
-    return int(round(percentage_fill * sampling_rate / resting_rate))
+    return int(round(percentage_fill * sampling_rate / breath_rate_hz))
 
 def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     """
@@ -545,7 +555,8 @@ def apply_micro_interp(
     signal: np.ndarray,
     sampling_rate: int,
     interp_method: str = "pchip",
-    percentage_fill: float = 0.3
+    percentage_fill: float = 0.3,
+    breath_rate_hz: float = 0.25,
 ) -> np.ndarray:
     """
     Interpolate small NaN gaps in a 1D signal.
@@ -560,6 +571,8 @@ def apply_micro_interp(
         Interpolation method: "pchip" (default) or "cubic_spline".
     percentage_fill : float
         Fraction of one breath cycle to fill. Default 0.3 (30%).
+    breath_rate_hz : float
+        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
 
     Returns
     -------
@@ -567,7 +580,7 @@ def apply_micro_interp(
         Signal with small NaN gaps filled via interpolation.
     """
     signal = np.asarray(signal, dtype=float)
-    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill)
+    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
     filled, _nan_mask = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
     return filled
 
@@ -577,7 +590,8 @@ def micro_interp_signals(
     out_path: str,
     sampling_rate: int,
     interp_method: str = "pchip",
-    percentage_fill: float = 0.3
+    percentage_fill: float = 0.3,
+    breath_rate_hz: float = 0.25,
 ) -> None:
     """
     Interpolate small NaN gaps in all columns except 'time' in all CSV files.
@@ -595,6 +609,8 @@ def micro_interp_signals(
         Interpolation method: "pchip" (default) or "cubic_spline".
     percentage_fill : float, optional
         Fraction of one breath cycle to fill. Default 0.3 (30%).
+    breath_rate_hz : float, optional
+        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -606,7 +622,12 @@ def micro_interp_signals(
 
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_micro_interp(df[column].values, sampling_rate, interp_method, percentage_fill)
+                df[column] = apply_micro_interp(
+                    df[column].values, sampling_rate,
+                    interp_method=interp_method,
+                    percentage_fill=percentage_fill,
+                    breath_rate_hz=breath_rate_hz,
+                )
 
         file_path_obj = Path(file_path)
         relative_path = file_path_obj.relative_to(in_path_obj)
@@ -931,21 +952,17 @@ def merge_close_anomalies(anomaly_mask, max_gap_samples=6000):
     return merged_mask
 
 
-def pad_anomaly_mask(anomaly_mask, pad_factor=2.0):
+def pad_anomaly_mask(anomaly_mask, pad_samples):
     """
-    Expands each contiguous anomaly region by a fraction of its own length.
-
-    For each block of True values of length L, adds (pad_factor * L / 2)
-    samples on each side, clamped to the array bounds.
+    Expands each contiguous anomaly region by a fixed number of samples
+    on each side, clamped to the array bounds.
 
     Parameters
     ----------
     anomaly_mask : array-like of bool
         Boolean mask where True indicates an anomalous sample.
-    pad_factor : float
-        Total padding as a multiple of the anomaly length, split equally
-        between both sides. Default 2.0 means each side gets 1x the anomaly
-        length (so the padded region is 3x the original).
+    pad_samples : int
+        Number of samples to add on each side of every anomaly block.
 
     Returns
     -------
@@ -961,9 +978,7 @@ def pad_anomaly_mask(anomaly_mask, pad_factor=2.0):
     ends = np.where(diff == -1)[0]
 
     for start, end in zip(starts, ends):
-        length = end - start
-        pad = int(length * pad_factor / 2)
-        padded[max(0, start - pad): min(n, end + pad)] = True
+        padded[max(0, start - pad_samples): min(n, end + pad_samples)] = True
 
     return padded
 
@@ -975,7 +990,7 @@ def detect_anomalies(
     window_size_seconds: float = 30,
     min_votes: int = 2,
     merge_gap_seconds: float = 0,
-    pad_factor: float = 2.0,
+    pad_seconds: float = 2.5,
 ) -> None:
     """
     Detects anomalies using an ensemble of IQR, Z-Score, and Energy-Ratio
@@ -995,13 +1010,13 @@ def detect_anomalies(
         Minimum number of methods that must flag a point (default: 2).
     merge_gap_seconds : float, optional
         Maximum gap in seconds between anomaly blocks to merge (default: 0, no merging).
-    pad_factor : float, optional
-        Padding around each anomaly as a multiple of its length, split equally
-        on both sides. Default 2.0 means each side is padded by 1x the anomaly
-        length. Set to 0 to disable padding.
+    pad_seconds : float, optional
+        Seconds of padding to add on each side of every anomaly block.
+        Default 0 disables padding.
     """
-    window_samples = int(window_size_seconds * sampling_rate)
-    merge_gap_samples = int(merge_gap_seconds * sampling_rate)
+    window_samples = _seconds_to_samples(window_size_seconds, sampling_rate)
+    merge_gap_samples = _seconds_to_samples(merge_gap_seconds, sampling_rate)
+    pad_samples = _seconds_to_samples(pad_seconds, sampling_rate)
 
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -1022,8 +1037,8 @@ def detect_anomalies(
                 if merge_gap_samples > 0:
                     mask = merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
 
-                if pad_factor > 0:
-                    mask = pad_anomaly_mask(mask, pad_factor=pad_factor)
+                if pad_samples > 0:
+                    mask = pad_anomaly_mask(mask, pad_samples=pad_samples)
 
                 df[f'{column}_anomaly'] = mask
                 df.loc[mask, column] = np.nan
@@ -1048,7 +1063,8 @@ def post_anomaly_interp_signals(
     out_path: str,
     sampling_rate: int,
     interp_method: str = "pchip",
-    percentage_fill: float = 0.5
+    percentage_fill: float = 0.5,
+    breath_rate_hz: float = 0.25,
 ) -> None:
     """
     Post-anomaly interpolation: fills larger NaN gaps (default 50% of one
@@ -1066,9 +1082,11 @@ def post_anomaly_interp_signals(
         Interpolation method: "pchip" (default) or "cubic_spline".
     percentage_fill : float, optional
         Fraction of one breath cycle to fill. Default 0.5 (50%).
+    breath_rate_hz : float, optional
+        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
     """
     mapped_files = map_files(in_path, file_ext='csv')
-    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill)
+    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
 
     in_path_obj = Path(in_path)
     out_path_obj = Path(out_path)
@@ -1157,7 +1175,7 @@ def _extract_clean_context(
 ) -> tuple[tuple[int, int, np.ndarray], tuple[int, int, np.ndarray]]:
     """Extract clean signal context on both sides of a gap [g0, g1)."""
     N = len(x)
-    L = int(round(context_s * fs))
+    L = _seconds_to_samples(context_s, fs)
     l0, l1 = max(0, g0 - L), g0
     r0, r1 = g1, min(N, g1 + L)
     xL = x[l0:l1]
@@ -1181,7 +1199,7 @@ def _detect_troughs(x_seg: np.ndarray, fs: float,
         y = s.to_numpy()
 
     min_period_s = 60.0 / max_bpm
-    min_dist = max(1, int(round(min_period_s * fs)))
+    min_dist = max(1, _seconds_to_samples(min_period_s, fs))
 
     mad = _robust_mad(y)
     if not np.isfinite(mad) or mad == 0:
@@ -1268,7 +1286,7 @@ def _synthesize_from_template(template: np.ndarray, fs: float,
 def _edge_crossfade(x: np.ndarray, y_gap: np.ndarray, g0: int, g1: int,
                     fs: float, blend_s: float):
     """Cross-fade y_gap to observed data at edges."""
-    B = int(round(blend_s * fs))
+    B = _seconds_to_samples(blend_s, fs)
     if B <= 0:
         return y_gap
 
@@ -1357,7 +1375,7 @@ def cycle_synthesis_impute(
         (l0, l1, xL), (r0, r1, xR) = _extract_clean_context(x_filled, g0, g1, fs, context_s)
 
         # Need at least 3 s of clean data per side to estimate breathing cycles
-        if np.isfinite(xL).sum() < int(round(3 * fs)) or np.isfinite(xR).sum() < int(round(3 * fs)):
+        if np.isfinite(xL).sum() < _seconds_to_samples(3, fs) or np.isfinite(xR).sum() < _seconds_to_samples(3, fs):
             continue
 
         # Detect troughs and estimate period/amplitude
