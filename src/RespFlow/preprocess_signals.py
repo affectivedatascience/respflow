@@ -931,21 +931,17 @@ def merge_close_anomalies(anomaly_mask, max_gap_samples=6000):
     return merged_mask
 
 
-def pad_anomaly_mask(anomaly_mask, pad_factor=2.0):
+def pad_anomaly_mask(anomaly_mask, pad_samples):
     """
-    Expands each contiguous anomaly region by a fraction of its own length.
-
-    For each block of True values of length L, adds (pad_factor * L / 2)
-    samples on each side, clamped to the array bounds.
+    Expands each contiguous anomaly region by a fixed number of samples
+    on each side, clamped to the array bounds.
 
     Parameters
     ----------
     anomaly_mask : array-like of bool
         Boolean mask where True indicates an anomalous sample.
-    pad_factor : float
-        Total padding as a multiple of the anomaly length, split equally
-        between both sides. Default 2.0 means each side gets 1x the anomaly
-        length (so the padded region is 3x the original).
+    pad_samples : int
+        Number of samples to add on each side of every anomaly block.
 
     Returns
     -------
@@ -961,9 +957,7 @@ def pad_anomaly_mask(anomaly_mask, pad_factor=2.0):
     ends = np.where(diff == -1)[0]
 
     for start, end in zip(starts, ends):
-        length = end - start
-        pad = int(length * pad_factor / 2)
-        padded[max(0, start - pad): min(n, end + pad)] = True
+        padded[max(0, start - pad_samples): min(n, end + pad_samples)] = True
 
     return padded
 
@@ -975,7 +969,7 @@ def detect_anomalies(
     window_size_seconds: float = 30,
     min_votes: int = 2,
     merge_gap_seconds: float = 0,
-    pad_factor: float = 2.0,
+    pad_seconds: float = 2.5,
 ) -> None:
     """
     Detects anomalies using an ensemble of IQR, Z-Score, and Energy-Ratio
@@ -995,13 +989,13 @@ def detect_anomalies(
         Minimum number of methods that must flag a point (default: 2).
     merge_gap_seconds : float, optional
         Maximum gap in seconds between anomaly blocks to merge (default: 0, no merging).
-    pad_factor : float, optional
-        Padding around each anomaly as a multiple of its length, split equally
-        on both sides. Default 2.0 means each side is padded by 1x the anomaly
-        length. Set to 0 to disable padding.
+    pad_seconds : float, optional
+        Seconds of padding to add on each side of every anomaly block.
+        Default 0 disables padding.
     """
     window_samples = int(window_size_seconds * sampling_rate)
     merge_gap_samples = int(merge_gap_seconds * sampling_rate)
+    pad_samples = int(pad_seconds * sampling_rate)
 
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -1022,8 +1016,8 @@ def detect_anomalies(
                 if merge_gap_samples > 0:
                     mask = merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
 
-                if pad_factor > 0:
-                    mask = pad_anomaly_mask(mask, pad_factor=pad_factor)
+                if pad_samples > 0:
+                    mask = pad_anomaly_mask(mask, pad_samples=pad_samples)
 
                 df[f'{column}_anomaly'] = mask
                 df.loc[mask, column] = np.nan
