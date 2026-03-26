@@ -98,22 +98,26 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
 
         fig = go.Figure()
         
-        # Reverse viridis to have lighter colours for earlier stages
-        viridis_colors = px.colors.sequential.Viridis[::-1] 
+        # Anchor viridis colours so each stage keeps a fixed colour
+        viridis_colors = px.colors.sequential.Viridis[::-1]
+        stage_color_map = {
+            stage: viridis_colors[i % len(viridis_colors)]
+            for i, stage in enumerate(stages)
+        }
 
-        for idx, stage in enumerate(selected_stages):
+        for stage in selected_stages:
             # 1. Find the file
             path = get_file_path(mapped_files, selected_file, stage)
             if not path:
                 continue
-                
+
             # 2. Load the data
             df = load_and_downsample(path, max_points)
             if df is None:
                 continue
 
             # 3. Add to plot
-            color = viridis_colors[idx % len(viridis_colors)]
+            color = stage_color_map[stage]
 
             # Data trace - blank gaps where NaN
             # Looks for column in file with label 'Respiration'
