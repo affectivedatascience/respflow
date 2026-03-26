@@ -1047,13 +1047,56 @@ def post_anomaly_interp_signals(
     percentage_fill : float, optional
         Fraction of one breath cycle to fill. Default 0.5 (50%).
     """
-    micro_interp_signals(
-        in_path=in_path,
-        out_path=out_path,
-        sampling_rate=sampling_rate,
-        interp_method=interp_method,
-        percentage_fill=percentage_fill,
-    )
+    mapped_files = map_files(in_path, file_ext='csv')
+    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill)
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        data_columns = [
+            c for c in df.columns
+            if c.lower() != 'time' and not c.endswith('_anomaly')
+        ]
+
+        for column in data_columns:
+            anomaly_col = f'{column}_anomaly'
+            if anomaly_col not in df.columns:
+                continue
+
+            signal = df[column].values.copy()
+            anomaly_mask = df[anomaly_col].values.astype(bool)
+            nan_mask = np.isnan(signal)
+            non_anomaly_nans = nan_mask & ~anomaly_mask
+
+            # Temporarily fill non-anomaly NaNs via linear interp so they
+            # don't distort the curve but aren't seen as gaps.
+            if np.any(non_anomaly_nans):
+                valid = np.where(~nan_mask)[0]
+                if len(valid) >= 2:
+                    signal[non_anomaly_nans] = np.interp(
+                        np.where(non_anomaly_nans)[0], valid, signal[valid]
+                    )
+
+            filled, _ = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+
+            # Restore non-anomaly NaNs
+            filled[non_anomaly_nans] = np.nan
+            df[column] = filled
+
+        # Drop anomaly mask columns
+        anomaly_cols = [c for c in df.columns if c.endswith('_anomaly')]
+        df.drop(columns=anomaly_cols, inplace=True)
+
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
 # =============================================================================
