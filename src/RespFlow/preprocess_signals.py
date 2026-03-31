@@ -4,6 +4,7 @@ import pandas as pd
 from pathlib import Path
 from scipy.ndimage import median_filter
 from scipy.ndimage import binary_closing
+from scipy.ndimage import gaussian_filter1d
 import numpy as np
 from dataclasses import dataclass
 
@@ -1539,5 +1540,105 @@ def impute_anomaly_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# GAUSSIAN SMOOTH
 # =============================================================================
 #
+
+def apply_gaussian_smooth(data: np.ndarray, sampling_rate: int, sigma_seconds: float = 0.05) -> np.ndarray:
+    """
+    Apply Gaussian smoothing to a 1D signal.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        1D input signal (must not contain NaN).
+    sampling_rate : int
+        Sampling rate in Hz.
+    sigma_seconds : float, optional
+        Standard deviation of the Gaussian kernel in seconds (default: 0.05).
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed signal, same length as input.
+    """
+    sigma_samples = _seconds_to_samples(sigma_seconds, sampling_rate)
+    if sigma_samples < 1:
+        sigma_samples = 1
+    return gaussian_filter1d(data, sigma=sigma_samples)
+
+
+def apply_gaussian_smooth_nan_safe(data: np.ndarray, sampling_rate: int, sigma_seconds: float = 0.05) -> np.ndarray:
+    """
+    NaN-safe Gaussian smoothing.
+
+    If the signal has no NaNs, smooths directly. If NaNs remain (e.g. large
+    unfilled gaps), smooths each contiguous non-NaN island separately.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        1D input signal (may contain NaN).
+    sampling_rate : int
+        Sampling rate in Hz.
+    sigma_seconds : float, optional
+        Standard deviation of the Gaussian kernel in seconds (default: 0.05).
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed signal with NaN positions preserved.
+    """
+    data = np.asarray(data, dtype=float)
+
+    # Fast path: no NaNs
+    if not np.any(np.isnan(data)):
+        return apply_gaussian_smooth(data, sampling_rate, sigma_seconds)
+
+    # NaNs present -- smooth each non-NaN island separately
+    sigma_samples = _seconds_to_samples(sigma_seconds, sampling_rate)
+    min_len = max(2 * sigma_samples + 1, 3)
+    result = np.full_like(data, np.nan)
+
+    for start, end, segment in iter_nan_islands(data):
+        if len(segment) >= min_len:
+            result[start:end] = apply_gaussian_smooth(segment, sampling_rate, sigma_seconds)
+
+    return result
+
+
+def gaussian_smooth_signals(in_path: str, out_path: str, sampling_rate: int, sigma_seconds: float = 0.05) -> None:
+    """
+    Applies Gaussian smoothing to all columns except 'time' in all CSV files.
+    Preserves the folder structure from in_path to out_path.
+
+    Parameters:
+    -----------
+    in_path : str
+        Input directory path
+    out_path : str
+        Output directory path
+    sampling_rate : int
+        Sampling rate in Hz
+    sigma_seconds : float, optional
+        Standard deviation of the Gaussian kernel in seconds (default: 0.05)
+    """
+    mapped_files = map_files(in_path, file_ext='csv')
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        for column in df.columns:
+            if column.lower() != 'time':
+                df[column] = apply_gaussian_smooth_nan_safe(df[column].values, sampling_rate, sigma_seconds)
+
+        file_path_obj = Path(file_path)
+        relative_path = file_path_obj.relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(output_file_path, index=False)
+
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
