@@ -304,11 +304,8 @@ def hard_fault_signals(
         Detection configuration. Uses defaults if None.
     columns : list[str], optional
         Column names to process. Only these columns (plus the time column)
-        will be kept in the output. Defaults to ['Respiration'].
+        will be kept in the output. Defaults to all non-time columns.
     """
-    if columns is None:
-        columns = ['Respiration']
-
     mapped_files = map_files(in_path, file_ext='csv')
 
     in_path_obj = Path(in_path)
@@ -320,17 +317,18 @@ def hard_fault_signals(
         # Find the time column (case-insensitive)
         time_col = next((c for c in df.columns if c.lower() == 'time'), None)
 
-        # Validate requested columns exist
-        missing = [c for c in columns if c not in df.columns]
-        if missing:
-            raise ValueError(
-                f"Columns {missing} not found in {file_path}. "
-                f"Available: {list(df.columns)}"
-            )
+        if columns is not None:
+            # Validate requested columns exist
+            missing = [c for c in columns if c not in df.columns]
+            if missing:
+                raise ValueError(
+                    f"Columns {missing} not found in {file_path}. "
+                    f"Available: {list(df.columns)}"
+                )
 
-        # Filter to time + requested columns
-        keep = ([time_col] if time_col else []) + columns
-        df = df[keep]
+            # Filter to time + requested columns
+            keep = ([time_col] if time_col else []) + columns
+            df = df[keep]
 
         df2 = apply_hard_fault_to_df(df, sampling_rate, config=config)
 
