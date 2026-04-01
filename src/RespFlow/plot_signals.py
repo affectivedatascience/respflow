@@ -6,7 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 
-def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
+def plot_dashboard(mapped_files : dict[str, str], column_name : str, max_points=10000) -> None:
 
     # Extract unique base filenames from the mapped files
     # Assumes files are structured as "stage/dir1/dir2/dir3/.../filename.csv"
@@ -123,7 +123,7 @@ def plot_dashboard(mapped_files : dict[str, str], max_points=10000) -> None:
             # Looks for column in file with label 'Respiration'
             fig.add_trace(go.Scattergl(
                 x=df[df.columns[0]],
-                y=df['Respiration'],
+                y=df[column_name],
                 mode='lines',
                 name=stage,
                 line=dict(color=color, width=1.5),
