@@ -9,9 +9,45 @@ import numpy as np
 from dataclasses import dataclass
 
 
-def _seconds_to_samples(seconds: float, fs: float) -> int:
-    """Convert a duration in seconds to the nearest whole number of samples."""
-    return int(round(seconds * fs))
+def seconds_to_samples(seconds: float, sampling_rate: float) -> int:
+    """
+    Convert a duration in seconds to the nearest whole number of samples.
+    
+    Parameters
+    ----------
+    seconds : float
+        Number of samples
+    sampling_rate : float
+        Sampling rate of signal
+        
+    Returns
+    -------
+    samples : int
+        Number of samples
+
+    """
+    return int(round(seconds * sampling_rate))
+
+def samples_to_seconds(samples: int, sampling_rate: float, decimal_places: int) -> float:
+    """
+    Convert a number of samples to duration in seconds, rounded to a specified 
+    number of decimal places.
+    
+    Parameters
+    ----------
+    samples : int
+        Number of samples
+    sampling_rate : float
+        Sampling rate of signal
+    decimal_places : int
+        Number of decimal places to round the result to
+        
+    Returns
+    -------
+    seconds : float
+        Duration in seconds
+    """
+    return round(samples / sampling_rate, decimal_places)
 
 #
 # =============================================================================
@@ -156,7 +192,7 @@ def apply_hard_fault(
     dx_abs = np.abs(dx)
     mask_dx_small = (dx_abs <= flat_eps) & ~np.isnan(dx)
 
-    min_flat_samples = _seconds_to_samples(config.flat_min_s, fs)
+    min_flat_samples = seconds_to_samples(config.flat_min_s, fs)
     mask_flatline = np.zeros(N, dtype=bool)
 
     # A run of small dx from [a, b) implies constant samples [a, b+1)
@@ -176,7 +212,7 @@ def apply_hard_fault(
     clip_tol = 0.01 * mad_x
 
     mask_clip_raw = (~mask_nan) & ((x <= rail_low + clip_tol) | (x >= rail_high - clip_tol))
-    min_clip_samples = _seconds_to_samples(config.clip_min_run_s, fs)
+    min_clip_samples = seconds_to_samples(config.clip_min_run_s, fs)
     mask_clip = _apply_min_run_length(mask_clip_raw, min_clip_samples)
 
     # -------------------------------------------------------------------------
@@ -190,9 +226,9 @@ def apply_hard_fault(
 
     step_candidates = np.where(np.abs(dx - dx_med) > step_threshold)[0]
     mask_step = np.zeros(N, dtype=bool)
-    step_pad = _seconds_to_samples(config.step_pad_s, fs)
+    step_pad = seconds_to_samples(config.step_pad_s, fs)
 
-    verify_win = _seconds_to_samples(config.step_verify_window_s, fs)
+    verify_win = seconds_to_samples(config.step_verify_window_s, fs)
     min_shift = 0.3 * mad_x
     # Massive spikes (3x threshold) bypass verification
     spike_bypass_thr = 3.0 * step_threshold
@@ -235,7 +271,7 @@ def apply_hard_fault(
     mask_hardfault = mask_nan | mask_flatline | mask_clip | mask_step
 
     if config.fault_pad_s and config.fault_pad_s > 0:
-        fault_pad = _seconds_to_samples(config.fault_pad_s, fs)
+        fault_pad = seconds_to_samples(config.fault_pad_s, fs)
         mask_hardfault = _dilate_mask(mask_hardfault, fault_pad)
 
     x[mask_hardfault] = np.nan
@@ -357,7 +393,7 @@ def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds:
     use_rolling = (signal_duration >= W0)
 
     if use_rolling:
-        k = _seconds_to_samples(W0, sampling_rate)  # window length in samples
+        k = seconds_to_samples(W0, sampling_rate)  # window length in samples
         if k % 2 == 0:
             k += 1
 
@@ -1013,9 +1049,9 @@ def detect_anomalies(
         Seconds of padding to add on each side of every anomaly block.
         Default 0 disables padding.
     """
-    window_samples = _seconds_to_samples(window_size_seconds, sampling_rate)
-    merge_gap_samples = _seconds_to_samples(merge_gap_seconds, sampling_rate)
-    pad_samples = _seconds_to_samples(pad_seconds, sampling_rate)
+    window_samples = seconds_to_samples(window_size_seconds, sampling_rate)
+    merge_gap_samples = seconds_to_samples(merge_gap_seconds, sampling_rate)
+    pad_samples = seconds_to_samples(pad_seconds, sampling_rate)
 
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -1174,7 +1210,7 @@ def _extract_clean_context(
 ) -> tuple[tuple[int, int, np.ndarray], tuple[int, int, np.ndarray]]:
     """Extract clean signal context on both sides of a gap [g0, g1)."""
     N = len(x)
-    L = _seconds_to_samples(context_s, fs)
+    L = seconds_to_samples(context_s, fs)
     l0, l1 = max(0, g0 - L), g0
     r0, r1 = g1, min(N, g1 + L)
     xL = x[l0:l1]
@@ -1198,7 +1234,7 @@ def _detect_troughs(x_seg: np.ndarray, fs: float,
         y = s.to_numpy()
 
     min_period_s = 60.0 / max_bpm
-    min_dist = max(1, _seconds_to_samples(min_period_s, fs))
+    min_dist = max(1, seconds_to_samples(min_period_s, fs))
 
     mad = _robust_mad(y)
     if not np.isfinite(mad) or mad == 0:
@@ -1285,7 +1321,7 @@ def _synthesize_from_template(template: np.ndarray, fs: float,
 def _edge_crossfade(x: np.ndarray, y_gap: np.ndarray, g0: int, g1: int,
                     fs: float, blend_s: float):
     """Cross-fade y_gap to observed data at edges."""
-    B = _seconds_to_samples(blend_s, fs)
+    B = seconds_to_samples(blend_s, fs)
     if B <= 0:
         return y_gap
 
@@ -1374,7 +1410,7 @@ def cycle_synthesis_impute(
         (l0, l1, xL), (r0, r1, xR) = _extract_clean_context(x_filled, g0, g1, fs, context_s)
 
         # Need at least 3 s of clean data per side to estimate breathing cycles
-        if np.isfinite(xL).sum() < _seconds_to_samples(3, fs) or np.isfinite(xR).sum() < _seconds_to_samples(3, fs):
+        if np.isfinite(xL).sum() < seconds_to_samples(3, fs) or np.isfinite(xR).sum() < seconds_to_samples(3, fs):
             continue
 
         # Detect troughs and estimate period/amplitude
@@ -1560,7 +1596,7 @@ def apply_gaussian_smooth(data: np.ndarray, sampling_rate: int, sigma_seconds: f
     np.ndarray
         Smoothed signal, same length as input.
     """
-    sigma_samples = _seconds_to_samples(sigma_seconds, sampling_rate)
+    sigma_samples = seconds_to_samples(sigma_seconds, sampling_rate)
     if sigma_samples < 1:
         sigma_samples = 1
     return gaussian_filter1d(data, sigma=sigma_samples)
@@ -1594,7 +1630,7 @@ def apply_gaussian_smooth_nan_safe(data: np.ndarray, sampling_rate: int, sigma_s
         return apply_gaussian_smooth(data, sampling_rate, sigma_seconds)
 
     # NaNs present -- smooth each non-NaN island separately
-    sigma_samples = _seconds_to_samples(sigma_seconds, sampling_rate)
+    sigma_samples = seconds_to_samples(sigma_seconds, sampling_rate)
     min_len = max(2 * sigma_samples + 1, 3)
     result = np.full_like(data, np.nan)
 
