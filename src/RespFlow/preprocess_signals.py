@@ -35,7 +35,7 @@ class HardFaultConfig:
     before detrend, micro-gap fill, and bandpass filtering.
     """
     # Flatline / stuck sensor
-    flat_min_s: float = 1.0              # minimum duration to qualify as flatline
+    flat_min_s: float = 0.5              # minimum duration to qualify as flatline
     flat_sensitivity: float = 0.05       # multiplier on MAD(dx) for flatline threshold
 
     # Clipping / saturation (data-driven rails)
@@ -988,7 +988,7 @@ def detect_anomalies(
     sampling_rate: int,
     window_size_seconds: float = 30,
     min_votes: int = 2,
-    merge_gap_seconds: float = 0,
+    merge_gap_seconds: float = 1,
     pad_seconds: float = 2.5,
 ) -> None:
     """
