@@ -1,54 +1,67 @@
 from RespFlow.access_files import map_files
 from scipy.signal import butter, sosfiltfilt, find_peaks
-import pandas as pd
-from pathlib import Path
-from scipy.ndimage import median_filter
-from scipy.ndimage import binary_closing
-from scipy.ndimage import gaussian_filter1d
-import numpy as np
+from scipy.interpolate import PchipInterpolator, CubicSpline
+from scipy.ndimage import binary_closing, gaussian_filter1d
 from dataclasses import dataclass
-
-
-def _seconds_to_samples(seconds: float, fs: float) -> int:
-    """Convert a duration in seconds to the nearest whole number of samples."""
-    return int(round(seconds * fs))
+from pathlib import Path
+import pandas as pd
+import numpy as np
 
 #
 # =============================================================================
 #
 
 """
-A collection of functions for preprocessing signals.
+A collection of functions for preprocessing signals and EMG data.
 """
 
 #
+# =============================================================================
+#
+#
 # HARD FAULT
+#
+#
 # =============================================================================
 #
 
 @dataclass
 class HardFaultConfig:
     """
-    Hard-fault detection parameters.
+    Configuration for hard-fault detection.
 
-    Hard faults are unambiguous sensor/data failures that should be masked
-    before detrend, micro-gap fill, and bandpass filtering.
+    Hard faults are unambiguous sensor/data failures (flatlines, clipping,
+    step discontinuities) that should be masked before downstream processing.
+
+    Parameters
+    ----------
+    flat_min_s : float
+        Minimum duration (seconds) for a run to qualify as a flatline. Default 0.5.
+    flat_sensitivity : float
+        Multiplier on MAD(dx) to set the flatline threshold. Default 0.05.
+    clip_percentile : float
+        Lower percentile for rail detection; upper rail is 100 minus this value.
+        Default 0.1.
+    clip_min_run_s : float
+        Minimum clipping run duration in seconds. Default 0.25.
+    step_sensitivity : float
+        Multiplier on MAD(dx) for the step-discontinuity threshold. Default 12.0.
+    step_pad_s : float
+        Padding (seconds) applied around detected steps. Default 0.05.
+    step_verify_window_s : float
+        Window (seconds) used to verify a sustained level shift. Default 0.5.
+    fault_pad_s : float
+        Padding (seconds) added before AND after each detected fault region.
+        A value of 1.0 adds 1 second on each side. Default 0.0.
     """
-    # Flatline / stuck sensor
-    flat_min_s: float = 1.0              # minimum duration to qualify as flatline
-    flat_sensitivity: float = 0.05       # multiplier on MAD(dx) for flatline threshold
-
-    # Clipping / saturation (data-driven rails)
-    clip_percentile: float = 0.1         # lower percentile for rail detection (upper = 100 - this)
-    clip_min_run_s: float = 0.25         # minimum clipping run duration (seconds)
-
-    # Step/discontinuity spikes
-    step_sensitivity: float = 12.0       # multiplier on MAD(dx) for step threshold
-    step_pad_s: float = 0.05             # pad around steps (seconds)
-    step_verify_window_s: float = 0.5    # window (seconds) to check sustained level shift
-
-    # Optional: pad around any hard fault
-    fault_pad_s: float = 0.0             # additional dilation of final hard-fault mask (seconds)
+    flat_min_s: float = 0.5
+    flat_sensitivity: float = 0.05
+    clip_percentile: float = 0.1
+    clip_min_run_s: float = 0.25
+    step_sensitivity: float = 12.0
+    step_pad_s: float = 0.05
+    step_verify_window_s: float = 0.5
+    fault_pad_s: float = 0.0
 
 
 def _runs_from_mask(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -79,7 +92,10 @@ def _apply_min_run_length(mask: np.ndarray, min_len: int) -> np.ndarray:
 
 
 def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
-    """Dilate a boolean mask by +/- radius samples using convolution."""
+    """
+    Dilate a boolean mask by radius samples on each side 
+    (so a radius of 1s pads 1s before AND 1s after each flagged region) using convolution.
+    """
     mask = np.asarray(mask, dtype=bool)
     if radius <= 0 or mask.size == 0:
         return mask
@@ -97,38 +113,37 @@ def _robust_mad(x: np.ndarray) -> float:
     return float(np.median(np.abs(x - med)))
 
 
-def apply_hard_fault(
+def _apply_hard_fault(
     signal: np.ndarray,
     sampling_rate: int,
     config: HardFaultConfig | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """
-    Detect hard faults and set them to NaN.
+    Detect hard faults in a 1-D signal and replace them with NaN.
 
     Returns:
         signal_out: signal with hard-fault samples set to NaN
-        info: dict with masks and thresholds used
+        info: dict with masks and thresholds used (useful for debugging but not passed onto user)
     """
     x = np.asarray(signal, dtype=float).copy()
     if x.ndim != 1:
-        raise ValueError("apply_hard_fault expects a 1D signal.")
+        raise ValueError("_apply_hard_fault expects a 1D signal.")
 
-    N = x.size
-    fs = float(sampling_rate)
+    num_samples = x.size
     if config is None:
         config = HardFaultConfig()
 
     mask_nan = np.isnan(x)
 
     # Early return for very short or fully-missing signals
-    if N < 3 or np.all(mask_nan):
+    if num_samples < 3 or np.all(mask_nan):
         mask_hardfault = mask_nan.copy()
         x[mask_hardfault] = np.nan
         info = {
             "mask_nan": mask_nan,
-            "mask_flatline": np.zeros(N, dtype=bool),
-            "mask_clip": np.zeros(N, dtype=bool),
-            "mask_step": np.zeros(N, dtype=bool),
+            "mask_flatline": np.zeros(num_samples, dtype=bool),
+            "mask_clip": np.zeros(num_samples, dtype=bool),
+            "mask_step": np.zeros(num_samples, dtype=bool),
             "mask_hardfault": mask_hardfault,
             "runs_hardfault": _runs_from_mask(mask_hardfault),
         }
@@ -156,12 +171,12 @@ def apply_hard_fault(
     dx_abs = np.abs(dx)
     mask_dx_small = (dx_abs <= flat_eps) & ~np.isnan(dx)
 
-    min_flat_samples = _seconds_to_samples(config.flat_min_s, fs)
-    mask_flatline = np.zeros(N, dtype=bool)
+    min_flat_samples = seconds_to_samples(config.flat_min_s, sampling_rate)
+    mask_flatline = np.zeros(num_samples, dtype=bool)
 
     # A run of small dx from [a, b) implies constant samples [a, b+1)
     for run_start, run_end in _runs_from_mask(mask_dx_small):
-        sample_start, sample_end = run_start, min(N, run_end + 1)
+        sample_start, sample_end = run_start, min(num_samples, run_end + 1)
         if (sample_end - sample_start) >= min_flat_samples:
             mask_flatline[sample_start:sample_end] = True
 
@@ -176,7 +191,7 @@ def apply_hard_fault(
     clip_tol = 0.01 * mad_x
 
     mask_clip_raw = (~mask_nan) & ((x <= rail_low + clip_tol) | (x >= rail_high - clip_tol))
-    min_clip_samples = _seconds_to_samples(config.clip_min_run_s, fs)
+    min_clip_samples = seconds_to_samples(config.clip_min_run_s, sampling_rate)
     mask_clip = _apply_min_run_length(mask_clip_raw, min_clip_samples)
 
     # -------------------------------------------------------------------------
@@ -189,10 +204,10 @@ def apply_hard_fault(
     step_threshold = max(config.step_sensitivity * mad_dx, 0.5 * mad_x)
 
     step_candidates = np.where(np.abs(dx - dx_med) > step_threshold)[0]
-    mask_step = np.zeros(N, dtype=bool)
-    step_pad = _seconds_to_samples(config.step_pad_s, fs)
+    mask_step = np.zeros(num_samples, dtype=bool)
+    step_pad = seconds_to_samples(config.step_pad_s, sampling_rate)
 
-    verify_win = _seconds_to_samples(config.step_verify_window_s, fs)
+    verify_win = seconds_to_samples(config.step_verify_window_s, sampling_rate)
     min_shift = 0.3 * mad_x
     # Massive spikes (3x threshold) bypass verification
     spike_bypass_thr = 3.0 * step_threshold
@@ -203,13 +218,13 @@ def apply_hard_fault(
         # Massive spike — flag unconditionally, no verification needed
         if dx_mag >= spike_bypass_thr:
             mask_start = max(0, i - step_pad)
-            mask_end = min(N, i + 2 + step_pad)
+            mask_end = min(num_samples, i + 2 + step_pad)
             mask_step[mask_start:mask_end] = True
             continue
 
         # Moderate spike — verify sustained level shift
         before_start = max(0, i - verify_win)
-        after_end = min(N, i + 2 + verify_win)
+        after_end = min(num_samples, i + 2 + verify_win)
         seg_before = x[before_start:i]
         seg_after = x[i + 1:after_end]
 
@@ -224,7 +239,7 @@ def apply_hard_fault(
             continue
 
         mask_start = max(0, i - step_pad)
-        mask_end = min(N, i + 2 + step_pad)
+        mask_end = min(num_samples, i + 2 + step_pad)
         mask_step[mask_start:mask_end] = True
 
     mask_step &= ~mask_nan
@@ -235,7 +250,7 @@ def apply_hard_fault(
     mask_hardfault = mask_nan | mask_flatline | mask_clip | mask_step
 
     if config.fault_pad_s and config.fault_pad_s > 0:
-        fault_pad = _seconds_to_samples(config.fault_pad_s, fs)
+        fault_pad = seconds_to_samples(config.fault_pad_s, sampling_rate)
         mask_hardfault = _dilate_mask(mask_hardfault, fault_pad)
 
     x[mask_hardfault] = np.nan
@@ -258,7 +273,7 @@ def apply_hard_fault(
     return x, info
 
 
-def apply_hard_fault_to_df(
+def _apply_hard_fault_to_df(
     df: pd.DataFrame,
     sampling_rate: int,
     config: HardFaultConfig | None = None,
@@ -275,7 +290,7 @@ def apply_hard_fault_to_df(
             continue
 
         x = out[column].to_numpy(dtype=float)
-        x_hf, _info = apply_hard_fault(x, sampling_rate, config=config)
+        x_hf, _info = _apply_hard_fault(x, sampling_rate, config=config)
         out[column] = x_hf
 
     return out
@@ -330,131 +345,41 @@ def hard_fault_signals(
             keep = ([time_col] if time_col else []) + columns
             df = df[keep]
 
-        df2 = apply_hard_fault_to_df(df, sampling_rate, config=config)
+        df2 = _apply_hard_fault_to_df(df, sampling_rate, config=config)
 
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
         df2.to_csv(output_file_path, index=False)
-
+        
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
-# DETREND
 # =============================================================================
 #
-
-def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds: int = 60) -> tuple:
-    # 60-second window default based on BreathMetrics paper
-    # if signal is shorter than window, use global median
-
-    W0 = window_size_seconds  # seconds
-    N = len(signal)
-    signal_duration = N / sampling_rate
-
-    use_rolling = (signal_duration >= W0)
-
-    if use_rolling:
-        k = _seconds_to_samples(W0, sampling_rate)  # window length in samples
-        if k % 2 == 0:
-            k += 1
-
-        # Guard: do not use a window longer than the signal
-        if k <= N:
-            s = pd.Series(signal)
-
-            # NaN-safe centered rolling median baseline
-            baseline = (
-                s.rolling(window=k, center=True, min_periods=max(1, k // 2))
-                .median()
-            )
-
-            # If baseline has NaNs (edges or long NaN runs), fill from nearest valid values
-            baseline = baseline.ffill().bfill().to_numpy()
-        else:
-            baseline = np.full(N, np.nanmedian(signal))
-    else:
-        baseline = np.full(N, np.nanmedian(signal))
-
-
-    # Detrend
-    detrended_signal = signal - baseline
-
-    return detrended_signal, baseline
-
-
-def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size_seconds: int = 60) -> None:
-    """
-    Applies detrending to all columns except 'time' in all CSV files.
-    Preserves the folder structure from in_path to out_path.
-
-    Parameters:
-    -----------
-    in_path : str
-        Input directory path
-    out_path : str
-        Output directory path
-    sampling_rate : float
-        Sampling rate in Hz
-    window_size_seconds : int, optional
-        Window size for median filter in seconds (default: 60)
-    """
-    mapped_files = map_files(in_path, file_ext='csv')
-
-    in_path_obj = Path(in_path)
-    out_path_obj = Path(out_path)
-
-    for file_path in mapped_files.values():
-        # Read the CSV file
-        df = pd.read_csv(file_path)
-
-        # Apply detrending to all columns except 'time'
-        for column in df.columns:
-            if column.lower() != 'time':
-                detrended_signal, _ = apply_detrend(df[column].values, sampling_rate, window_size_seconds)
-                df[column] = detrended_signal
-
-        # Determine the relative path from in_path to preserve folder structure
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
-
-        # Create output path
-        output_file_path = out_path_obj / relative_path
-
-        # Create output directory if it doesn't exist
-        output_file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Save the detrended data
-        df.to_csv(output_file_path, index=False)
-
-    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
-
 #
 # MICRO INTERP
+#
+#
 # =============================================================================
 #
 
-def default_max_gap(sampling_rate: int, percentage_fill: float = 0.3, breath_rate_hz: float = 0.25) -> int:
+def _default_max_gap(
+    sampling_rate: int,
+    percentage_fill: float = 0.3,
+    breath_rate_hz: float = 0.25,
+) -> int:
     """
-    Compute a default max_gap (in samples) for NaN micro gap interpolation.
-
-    Rule: percentage_fill of one respiratory cycle length.
-    At 2000 Hz, 0.25 Hz: 0.3 * (2000 / 0.25) = 2400 samples.
-
-    Parameters
-    ----------
-    sampling_rate : int
-        Sampling rate in Hz.
-    percentage_fill : float
-        Fraction of one breath cycle to fill. Default 0.3 (30%).
-    breath_rate_hz : float
-        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
+    Compute the max gap (samples) as a fraction of one respiratory cycle.
+    
+    Example: at 2000 Hz with a 0.25 Hz breath rate, 
+    0.3 * (2000 / 0.25) = 2400 samples.
     """
     return int(round(percentage_fill * sampling_rate / breath_rate_hz))
 
-def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
+
+def _nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     """
     Return (start, end, length) for each contiguous NaN gap in a 1D array.
     Indices are half-open: x[start:end] are all NaN.
@@ -465,10 +390,12 @@ def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     if not np.any(is_nan):
         return []
 
+    # diff produces +1 where a NaN run starts and -1 where it ends
     d = np.diff(is_nan.astype(np.int8))
-    starts = np.where(d == 1)[0] + 1
+    starts = np.where(d == 1)[0] + 1   # +1 because diff shifts indices left by 1
     ends = np.where(d == -1)[0] + 1
 
+    # diff misses runs that touch the edges, so handle those manually
     if is_nan[0]:
         starts = np.r_[0, starts]
     if is_nan[-1]:
@@ -476,23 +403,18 @@ def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
 
     return [(s, e, e - s) for s, e in zip(starts.tolist(), ends.tolist())]
 
-def interpolate_nan_gaps(
+
+def _interpolate_nan_gaps(
     data: np.ndarray,
     method: str,
-    max_gap: int | None = None
+    max_gap: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Interpolate NaN gaps in data.
+    Interpolate NaN gaps in a 1-D array.
 
-    Parameters:
-        data: 1D array with NaN gaps
-        method: "pchip" or "cubic"
-        max_gap: If provided, only interpolate gaps with length <= max_gap
-
-    Returns:
-        (interpolated_data, nan_mask) where nan_mask marks original NaN positions
+    Returns (filled_data, original_nan_mask). Only gaps with length <= max_gap
+    are filled when max_gap is provided.
     """
-    from scipy.interpolate import PchipInterpolator, CubicSpline
 
     data = np.asarray(data, dtype=float)
     nan_mask = np.isnan(data)
@@ -501,7 +423,7 @@ def interpolate_nan_gaps(
         return data.copy(), nan_mask
 
     result = data.copy()
-    gaps = nan_gap_indices(data)
+    gaps = _nan_gap_indices(data)
 
     # Determine which gaps to interpolate
     if max_gap is not None:
@@ -539,9 +461,8 @@ def interpolate_nan_gaps(
     elif method == "cubic_spline":
         interp = CubicSpline(valid_idx, valid_vals)
     else:
-        raise ValueError("Invalid interpolation method specified")
-        
-    
+        raise ValueError(f"Unknown interpolation method: {method!r}")
+
 
     # Fill only the gaps we want to fill
     fill_idx = np.where(fill_mask)[0]
@@ -550,37 +471,19 @@ def interpolate_nan_gaps(
     return result, nan_mask
 
 
-def apply_micro_interp(
+def _apply_micro_interp(
     signal: np.ndarray,
     sampling_rate: int,
     interp_method: str = "pchip",
     percentage_fill: float = 0.3,
     breath_rate_hz: float = 0.25,
 ) -> np.ndarray:
-    """
-    Interpolate small NaN gaps in a 1D signal.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        1D input signal (may contain NaN).
-    sampling_rate : int
-        Sampling rate in Hz.
-    interp_method : str
-        Interpolation method: "pchip" (default) or "cubic_spline".
-    percentage_fill : float
-        Fraction of one breath cycle to fill. Default 0.3 (30%).
-    breath_rate_hz : float
-        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
-
-    Returns
-    -------
-    np.ndarray
-        Signal with small NaN gaps filled via interpolation.
-    """
+    """Interpolate small NaN gaps in a 1-D signal using the configured max gap."""
     signal = np.asarray(signal, dtype=float)
-    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
-    filled, _nan_mask = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+    max_gap = _default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
+    
+    # mask not needed here
+    filled, _ = _interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
     return filled
 
 
@@ -593,23 +496,26 @@ def micro_interp_signals(
     breath_rate_hz: float = 0.25,
 ) -> None:
     """
-    Interpolate small NaN gaps in all columns except 'time' in all CSV files.
-    Preserves folder structure from in_path to out_path.
+    Interpolate small NaN gaps in all signal columns across all CSV files.
+
+    Gaps shorter than a fraction of one respiratory cycle are filled via
+    interpolation. Folder structure from ``in_path`` is preserved in ``out_path``.
 
     Parameters
     ----------
     in_path : str
-        Input directory path
+        Input directory path containing CSV files.
     out_path : str
-        Output directory path
+        Output directory path for interpolated CSV files.
     sampling_rate : int
-        Sampling rate in Hz
+        Sampling rate in Hz.
     interp_method : str, optional
-        Interpolation method: "pchip" (default) or "cubic_spline".
+        Interpolation method: ``"pchip"`` (default) or ``"cubic_spline"``.
     percentage_fill : float, optional
-        Fraction of one breath cycle to fill. Default 0.3 (30%).
+        Fraction of one breath cycle used as the max gap to fill. Default 0.3.
     breath_rate_hz : float, optional
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
+        This is approx adult resting breathing rate.
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -621,20 +527,117 @@ def micro_interp_signals(
 
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_micro_interp(
+                df[column] = _apply_micro_interp(
                     df[column].values, sampling_rate,
                     interp_method=interp_method,
                     percentage_fill=percentage_fill,
                     breath_rate_hz=breath_rate_hz,
                 )
 
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
         df.to_csv(output_file_path, index=False)
 
+    print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+
+#
+# =============================================================================
+#
+#
+# DETREND
+#
+#
+# =============================================================================
+#
+
+def _apply_detrend(
+    signal: np.ndarray,
+    sampling_rate: int,
+    window_size_seconds: int = 60, # 60-second window default based on BreathMetrics paper
+) -> tuple[np.ndarray, np.ndarray]:
+    """Subtract a rolling-median baseline from a 1-D signal."""
+    num_samples = len(signal)
+    signal_duration = num_samples / sampling_rate
+
+    # if signal is shorter than window, use global median
+    if signal_duration >= window_size_seconds:
+        window_samples = seconds_to_samples(window_size_seconds, sampling_rate)
+        
+        # rolling with center=True requires an odd window to be truly centered
+        if window_samples % 2 == 0: 
+            window_samples += 1
+
+        # Guard: do not use a window longer than the signal
+        if window_samples <= num_samples:
+            s = pd.Series(signal)
+
+            # NaN-safe centered rolling median baseline
+            # Require at least half the window to be filled before computing a median,
+            # so edge estimates aren't based on just a handful of samples. The max(1, ...)
+            # ensures min_periods is never 0 for very small windows.
+            baseline = (
+                s.rolling(window=window_samples, center=True, min_periods=max(1, window_samples // 2))
+                .median()
+            )
+
+            # If baseline has NaNs (edges or long NaN runs), fill from nearest valid values
+            baseline = baseline.ffill().bfill().to_numpy()
+        else:
+            baseline = np.full(num_samples, np.nanmedian(signal))
+    else:
+        baseline = np.full(num_samples, np.nanmedian(signal))
+
+    # Detrend
+    detrended_signal = signal - baseline
+
+    return detrended_signal, baseline
+
+
+def detrend_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    window_size_seconds: int = 60,
+) -> None:
+    """
+    Apply rolling-median detrending to all signal columns in all CSV files.
+
+    Subtracts a rolling-median baseline from each non-time column and writes
+    the detrended data to ``out_path``, preserving folder structure.
+
+    Parameters
+    ----------
+    in_path : str
+        Input directory path containing CSV files.
+    out_path : str
+        Output directory path for detrended CSV files.
+    sampling_rate : int
+        Sampling rate in Hz.
+    window_size_seconds : int, optional
+        Window size for the rolling median in seconds. Default 60.
+        If a signal is shorter than this window, a global median is used instead.
+    """
+    mapped_files = map_files(in_path, file_ext='csv')
+
+    in_path_obj = Path(in_path)
+    out_path_obj = Path(out_path)
+
+    for file_path in mapped_files.values():
+        df = pd.read_csv(file_path)
+
+        for column in df.columns:
+            if column.lower() != 'time':
+                detrended, _ = _apply_detrend(df[column].values, sampling_rate, window_size_seconds)
+                df[column] = detrended
+
+        relative_path = Path(file_path).relative_to(in_path_obj)
+        output_file_path = out_path_obj / relative_path
+        output_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        df.to_csv(output_file_path, index=False)
+    
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
@@ -988,7 +991,7 @@ def detect_anomalies(
     sampling_rate: int,
     window_size_seconds: float = 30,
     min_votes: int = 2,
-    merge_gap_seconds: float = 0,
+    merge_gap_seconds: float = 1,
     pad_seconds: float = 2.5,
 ) -> None:
     """
@@ -1013,9 +1016,9 @@ def detect_anomalies(
         Seconds of padding to add on each side of every anomaly block.
         Default 0 disables padding.
     """
-    window_samples = _seconds_to_samples(window_size_seconds, sampling_rate)
-    merge_gap_samples = _seconds_to_samples(merge_gap_seconds, sampling_rate)
-    pad_samples = _seconds_to_samples(pad_seconds, sampling_rate)
+    window_samples = seconds_to_samples(window_size_seconds, sampling_rate)
+    merge_gap_samples = seconds_to_samples(merge_gap_seconds, sampling_rate)
+    pad_samples = seconds_to_samples(pad_seconds, sampling_rate)
 
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -1085,7 +1088,7 @@ def post_anomaly_interp_signals(
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
     """
     mapped_files = map_files(in_path, file_ext='csv')
-    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
+    max_gap = _default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
 
     in_path_obj = Path(in_path)
     out_path_obj = Path(out_path)
@@ -1117,7 +1120,7 @@ def post_anomaly_interp_signals(
                         np.where(non_anomaly_nans)[0], valid, signal[valid]
                     )
 
-            filled, _ = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+            filled, _ = _interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
 
             # Restore non-anomaly NaNs
             filled[non_anomaly_nans] = np.nan
@@ -1174,7 +1177,7 @@ def _extract_clean_context(
 ) -> tuple[tuple[int, int, np.ndarray], tuple[int, int, np.ndarray]]:
     """Extract clean signal context on both sides of a gap [g0, g1)."""
     N = len(x)
-    L = _seconds_to_samples(context_s, fs)
+    L = seconds_to_samples(context_s, fs)
     l0, l1 = max(0, g0 - L), g0
     r0, r1 = g1, min(N, g1 + L)
     xL = x[l0:l1]
@@ -1198,7 +1201,7 @@ def _detect_troughs(x_seg: np.ndarray, fs: float,
         y = s.to_numpy()
 
     min_period_s = 60.0 / max_bpm
-    min_dist = max(1, _seconds_to_samples(min_period_s, fs))
+    min_dist = max(1, seconds_to_samples(min_period_s, fs))
 
     mad = _robust_mad(y)
     if not np.isfinite(mad) or mad == 0:
@@ -1285,7 +1288,7 @@ def _synthesize_from_template(template: np.ndarray, fs: float,
 def _edge_crossfade(x: np.ndarray, y_gap: np.ndarray, g0: int, g1: int,
                     fs: float, blend_s: float):
     """Cross-fade y_gap to observed data at edges."""
-    B = _seconds_to_samples(blend_s, fs)
+    B = seconds_to_samples(blend_s, fs)
     if B <= 0:
         return y_gap
 
@@ -1359,7 +1362,7 @@ def cycle_synthesis_impute(
     x_filled = x.copy()
     mask_imputed = np.zeros(len(x), dtype=bool)
 
-    gaps = nan_gap_indices(x_filled)
+    gaps = _nan_gap_indices(x_filled)
 
     # Only process gaps that overlap the anomaly mask
     if anomaly_mask is not None:
@@ -1374,7 +1377,7 @@ def cycle_synthesis_impute(
         (l0, l1, xL), (r0, r1, xR) = _extract_clean_context(x_filled, g0, g1, fs, context_s)
 
         # Need at least 3 s of clean data per side to estimate breathing cycles
-        if np.isfinite(xL).sum() < _seconds_to_samples(3, fs) or np.isfinite(xR).sum() < _seconds_to_samples(3, fs):
+        if np.isfinite(xL).sum() < seconds_to_samples(3, fs) or np.isfinite(xR).sum() < seconds_to_samples(3, fs):
             continue
 
         # Detect troughs and estimate period/amplitude
@@ -1560,7 +1563,7 @@ def apply_gaussian_smooth(data: np.ndarray, sampling_rate: int, sigma_seconds: f
     np.ndarray
         Smoothed signal, same length as input.
     """
-    sigma_samples = _seconds_to_samples(sigma_seconds, sampling_rate)
+    sigma_samples = seconds_to_samples(sigma_seconds, sampling_rate)
     if sigma_samples < 1:
         sigma_samples = 1
     return gaussian_filter1d(data, sigma=sigma_samples)
@@ -1594,7 +1597,7 @@ def apply_gaussian_smooth_nan_safe(data: np.ndarray, sampling_rate: int, sigma_s
         return apply_gaussian_smooth(data, sampling_rate, sigma_seconds)
 
     # NaNs present -- smooth each non-NaN island separately
-    sigma_samples = _seconds_to_samples(sigma_seconds, sampling_rate)
+    sigma_samples = seconds_to_samples(sigma_seconds, sampling_rate)
     min_len = max(2 * sigma_samples + 1, 3)
     result = np.full_like(data, np.nan)
 
@@ -1640,3 +1643,134 @@ def gaussian_smooth_signals(in_path: str, out_path: str, sampling_rate: int, sig
         df.to_csv(output_file_path, index=False)
 
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+    
+#
+# =============================================================================
+#
+# OTHER
+#
+# =============================================================================
+#
+
+def seconds_to_samples(seconds: float, sampling_rate: float) -> int:
+    """Convert a duration in seconds to the nearest whole number of samples."""
+    return int(round(seconds * sampling_rate))
+
+def samples_to_seconds(samples: int, sampling_rate: float, decimal_places: int) -> float:
+    """Convert a number of samples to a duration in seconds, rounded to the given decimal places."""
+    return round(samples / sampling_rate, decimal_places)
+
+def clean_signals(
+    path_names: dict,
+    sampling_rate: int,
+    columns: list[str] | None = None,
+    hard_fault_config: HardFaultConfig | None = None,
+    detrend_window_s: int = 60,
+    passband: str | tuple = 'default',
+    do_anomaly: bool = True,
+    do_smooth: bool = True,
+    sigma_seconds: float = 0.05,
+) -> None:
+    """
+    Apply all respiratory preprocessing steps to all signal files in a
+    folder and its subfolders. Uses the ``path_names`` dictionary, starting
+    with files in the ``'raw'`` path and moving through each stage as
+    filters are applied.
+
+    Optionally, ``do_anomaly`` and ``do_smooth`` can be set to True to
+    perform those steps.
+
+    Parameters
+    ----------
+    path_names : dict[str, str]
+        A dictionary of file locations with keys for each stage in the
+        processing pipeline. Required keys: ``'raw'``, ``'hard_fault'``,
+        ``'micro_interp'``, ``'detrend'``, ``'bandpass'``.
+        The dictionary can be created with the ``make_paths`` function.
+    sampling_rate : int
+        The sampling rate of the signal files in Hz.
+    columns : list[str], optional
+        Column names to process. Defaults to all non-time columns.
+    hard_fault_config : HardFaultConfig, optional
+        Configuration for hard-fault detection. Uses defaults if None.
+    detrend_window_s : int, optional
+        Window size in seconds for rolling-median detrending. Default 60.
+    passband : str or tuple, optional
+        Bandpass preset name or ``(lowcut, highcut)`` tuple in Hz.
+        Default ``'default'`` (0.05-2.0 Hz).
+    do_anomaly : bool, optional
+        Whether to run anomaly detection, post-anomaly interpolation, and
+        cycle-synthesis imputation. Default True.
+    do_smooth : bool, optional
+        Whether to apply Gaussian smoothing. Default True.
+    sigma_seconds : float, optional
+        Standard deviation of the Gaussian kernel in seconds for the
+        smoothing step. Default 0.05.
+
+    Raises
+    ------
+    KeyError
+        If a required key is missing from ``path_names``, or if an optional
+        step is enabled but its key is missing.
+    """
+    # --- validate required paths ---
+    required = ['raw', 'hard_fault', 'micro_interp', 'detrend', 'bandpass']
+    for key in required:
+        if key not in path_names:
+            raise KeyError(
+                f"'{key}' path not detected in provided dictionary (path_names)."
+            )
+
+    # --- required steps ---
+    hard_fault_signals(
+        path_names['raw'], path_names['hard_fault'],
+        sampling_rate, config=hard_fault_config, columns=columns,
+    )
+    micro_interp_signals(
+        path_names['hard_fault'], path_names['micro_interp'],
+        sampling_rate,
+    )
+    detrend_signals(
+        path_names['micro_interp'], path_names['detrend'],
+        sampling_rate, window_size_seconds=detrend_window_s,
+    )
+    bandpass_filter_signals(
+        path_names['detrend'], path_names['bandpass'],
+        sampling_rate, passband=passband,
+    )
+
+    last = 'bandpass'
+
+    # --- optional: anomaly detection + imputation ---
+    if do_anomaly:
+        for key in ('anomaly', 'post_anomaly_interp', 'impute_anomaly'):
+            if key not in path_names:
+                raise KeyError(
+                    f"'{key}' path not detected in provided dictionary "
+                    f"(path_names). Required when do_anomaly=True."
+                )
+        detect_anomalies(
+            path_names[last], path_names['anomaly'],
+            sampling_rate,
+        )
+        post_anomaly_interp_signals(
+            path_names['anomaly'], path_names['post_anomaly_interp'],
+            sampling_rate,
+        )
+        impute_anomaly_signals(
+            path_names['post_anomaly_interp'], path_names['impute_anomaly'],
+            sampling_rate,
+        )
+        last = 'impute_anomaly'
+
+    # --- optional: smoothing ---
+    if do_smooth:
+        if 'smooth' not in path_names:
+            raise KeyError(
+                "'smooth' path not detected in provided dictionary "
+                "(path_names). Required when do_smooth=True."
+            )
+        gaussian_smooth_signals(
+            path_names[last], path_names['smooth'],
+            sampling_rate, sigma_seconds=sigma_seconds,
+        )
