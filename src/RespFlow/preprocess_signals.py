@@ -463,25 +463,21 @@ def detrend_signals(
 # =============================================================================
 #
 
-def default_max_gap(sampling_rate: int, percentage_fill: float = 0.3, breath_rate_hz: float = 0.25) -> int:
+def _default_max_gap(
+    sampling_rate: int,
+    percentage_fill: float = 0.3,
+    breath_rate_hz: float = 0.25,
+) -> int:
     """
-    Compute a default max_gap (in samples) for NaN micro gap interpolation.
-
-    Rule: percentage_fill of one respiratory cycle length.
-    At 2000 Hz, 0.25 Hz: 0.3 * (2000 / 0.25) = 2400 samples.
-
-    Parameters
-    ----------
-    sampling_rate : int
-        Sampling rate in Hz.
-    percentage_fill : float
-        Fraction of one breath cycle to fill. Default 0.3 (30%).
-    breath_rate_hz : float
-        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
+    Compute the max gap (samples) as a fraction of one respiratory cycle.
+    
+    Example: at 2000 Hz with a 0.25 Hz breath rate, 
+    0.3 * (2000 / 0.25) = 2400 samples.
     """
     return int(round(percentage_fill * sampling_rate / breath_rate_hz))
 
-def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
+
+def _nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     """
     Return (start, end, length) for each contiguous NaN gap in a 1D array.
     Indices are half-open: x[start:end] are all NaN.
@@ -492,10 +488,12 @@ def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
     if not np.any(is_nan):
         return []
 
+    # diff produces +1 where a NaN run starts and -1 where it ends
     d = np.diff(is_nan.astype(np.int8))
-    starts = np.where(d == 1)[0] + 1
+    starts = np.where(d == 1)[0] + 1   # +1 because diff shifts indices left by 1
     ends = np.where(d == -1)[0] + 1
 
+    # diff misses runs that touch the edges, so handle those manually
     if is_nan[0]:
         starts = np.r_[0, starts]
     if is_nan[-1]:
@@ -503,23 +501,18 @@ def nan_gap_indices(x: np.ndarray) -> list[tuple[int, int, int]]:
 
     return [(s, e, e - s) for s, e in zip(starts.tolist(), ends.tolist())]
 
-def interpolate_nan_gaps(
+
+def _interpolate_nan_gaps(
     data: np.ndarray,
     method: str,
-    max_gap: int | None = None
+    max_gap: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Interpolate NaN gaps in data.
+    Interpolate NaN gaps in a 1-D array.
 
-    Parameters:
-        data: 1D array with NaN gaps
-        method: "pchip" or "cubic"
-        max_gap: If provided, only interpolate gaps with length <= max_gap
-
-    Returns:
-        (interpolated_data, nan_mask) where nan_mask marks original NaN positions
+    Returns (filled_data, original_nan_mask). Only gaps with length <= max_gap
+    are filled when max_gap is provided.
     """
-    from scipy.interpolate import PchipInterpolator, CubicSpline
 
     data = np.asarray(data, dtype=float)
     nan_mask = np.isnan(data)
@@ -528,7 +521,7 @@ def interpolate_nan_gaps(
         return data.copy(), nan_mask
 
     result = data.copy()
-    gaps = nan_gap_indices(data)
+    gaps = _nan_gap_indices(data)
 
     # Determine which gaps to interpolate
     if max_gap is not None:
@@ -566,9 +559,8 @@ def interpolate_nan_gaps(
     elif method == "cubic_spline":
         interp = CubicSpline(valid_idx, valid_vals)
     else:
-        raise ValueError("Invalid interpolation method specified")
-        
-    
+        raise ValueError(f"Unknown interpolation method: {method!r}")
+
 
     # Fill only the gaps we want to fill
     fill_idx = np.where(fill_mask)[0]
@@ -577,37 +569,20 @@ def interpolate_nan_gaps(
     return result, nan_mask
 
 
-def apply_micro_interp(
+def _apply_micro_interp(
     signal: np.ndarray,
     sampling_rate: int,
     interp_method: str = "pchip",
     percentage_fill: float = 0.3,
     breath_rate_hz: float = 0.25,
 ) -> np.ndarray:
-    """
-    Interpolate small NaN gaps in a 1D signal.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        1D input signal (may contain NaN).
-    sampling_rate : int
-        Sampling rate in Hz.
-    interp_method : str
-        Interpolation method: "pchip" (default) or "cubic_spline".
-    percentage_fill : float
-        Fraction of one breath cycle to fill. Default 0.3 (30%).
-    breath_rate_hz : float
-        Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
-
-    Returns
-    -------
-    np.ndarray
-        Signal with small NaN gaps filled via interpolation.
-    """
+    """Interpolate small NaN gaps in a 1-D signal using the configured max gap."""
     signal = np.asarray(signal, dtype=float)
-    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
-    filled, _nan_mask = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+    max_gap = _default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
+    
+    # Original mask not needed for first interpolation, but it will be used in
+    # post_anomaly_interp_signals
+    filled, _ = _interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
     return filled
 
 
@@ -620,23 +595,26 @@ def micro_interp_signals(
     breath_rate_hz: float = 0.25,
 ) -> None:
     """
-    Interpolate small NaN gaps in all columns except 'time' in all CSV files.
-    Preserves folder structure from in_path to out_path.
+    Interpolate small NaN gaps in all signal columns across all CSV files.
+
+    Gaps shorter than a fraction of one respiratory cycle are filled via
+    interpolation. Folder structure from ``in_path`` is preserved in ``out_path``.
 
     Parameters
     ----------
     in_path : str
-        Input directory path
+        Input directory path containing CSV files.
     out_path : str
-        Output directory path
+        Output directory path for interpolated CSV files.
     sampling_rate : int
-        Sampling rate in Hz
+        Sampling rate in Hz.
     interp_method : str, optional
-        Interpolation method: "pchip" (default) or "cubic_spline".
+        Interpolation method: ``"pchip"`` (default) or ``"cubic_spline"``.
     percentage_fill : float, optional
-        Fraction of one breath cycle to fill. Default 0.3 (30%).
+        Fraction of one breath cycle used as the max gap to fill. Default 0.3.
     breath_rate_hz : float, optional
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
+        This is approx adult resting breathing rate.
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -648,15 +626,14 @@ def micro_interp_signals(
 
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_micro_interp(
+                df[column] = _apply_micro_interp(
                     df[column].values, sampling_rate,
                     interp_method=interp_method,
                     percentage_fill=percentage_fill,
                     breath_rate_hz=breath_rate_hz,
                 )
 
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
