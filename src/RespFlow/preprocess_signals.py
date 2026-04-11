@@ -1676,3 +1676,134 @@ def gaussian_smooth_signals(in_path: str, out_path: str, sampling_rate: int, sig
         df.to_csv(output_file_path, index=False)
 
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
+    
+#
+# =============================================================================
+#
+# OTHER
+#
+# =============================================================================
+#
+
+def seconds_to_samples(seconds: float, sampling_rate: float) -> int:
+    """Convert a duration in seconds to the nearest whole number of samples."""
+    return int(round(seconds * sampling_rate))
+
+def samples_to_seconds(samples: int, sampling_rate: float, decimal_places: int) -> float:
+    """Convert a number of samples to a duration in seconds, rounded to the given decimal places."""
+    return round(samples / sampling_rate, decimal_places)
+
+def clean_signals(
+    path_names: dict,
+    sampling_rate: int,
+    columns: list[str] | None = None,
+    hard_fault_config: HardFaultConfig | None = None,
+    detrend_window_s: int = 60,
+    passband: str | tuple = 'default',
+    do_anomaly: bool = True,
+    do_smooth: bool = True,
+    sigma_seconds: float = 0.05,
+) -> None:
+    """
+    Apply all respiratory preprocessing steps to all signal files in a
+    folder and its subfolders. Uses the ``path_names`` dictionary, starting
+    with files in the ``'raw'`` path and moving through each stage as
+    filters are applied.
+
+    Optionally, ``do_anomaly`` and ``do_smooth`` can be set to True to
+    perform those steps.
+
+    Parameters
+    ----------
+    path_names : dict[str, str]
+        A dictionary of file locations with keys for each stage in the
+        processing pipeline. Required keys: ``'raw'``, ``'hard_fault'``,
+        ``'micro_interp'``, ``'detrend'``, ``'bandpass'``.
+        The dictionary can be created with the ``make_paths`` function.
+    sampling_rate : int
+        The sampling rate of the signal files in Hz.
+    columns : list[str], optional
+        Column names to process. Defaults to all non-time columns.
+    hard_fault_config : HardFaultConfig, optional
+        Configuration for hard-fault detection. Uses defaults if None.
+    detrend_window_s : int, optional
+        Window size in seconds for rolling-median detrending. Default 60.
+    passband : str or tuple, optional
+        Bandpass preset name or ``(lowcut, highcut)`` tuple in Hz.
+        Default ``'default'`` (0.05-2.0 Hz).
+    do_anomaly : bool, optional
+        Whether to run anomaly detection, post-anomaly interpolation, and
+        cycle-synthesis imputation. Default True.
+    do_smooth : bool, optional
+        Whether to apply Gaussian smoothing. Default True.
+    sigma_seconds : float, optional
+        Standard deviation of the Gaussian kernel in seconds for the
+        smoothing step. Default 0.05.
+
+    Raises
+    ------
+    KeyError
+        If a required key is missing from ``path_names``, or if an optional
+        step is enabled but its key is missing.
+    """
+    # --- validate required paths ---
+    required = ['raw', 'hard_fault', 'micro_interp', 'detrend', 'bandpass']
+    for key in required:
+        if key not in path_names:
+            raise KeyError(
+                f"'{key}' path not detected in provided dictionary (path_names)."
+            )
+
+    # --- required steps ---
+    hard_fault_signals(
+        path_names['raw'], path_names['hard_fault'],
+        sampling_rate, config=hard_fault_config, columns=columns,
+    )
+    micro_interp_signals(
+        path_names['hard_fault'], path_names['micro_interp'],
+        sampling_rate,
+    )
+    detrend_signals(
+        path_names['micro_interp'], path_names['detrend'],
+        sampling_rate, window_size_seconds=detrend_window_s,
+    )
+    bandpass_filter_signals(
+        path_names['detrend'], path_names['bandpass'],
+        sampling_rate, passband=passband,
+    )
+
+    last = 'bandpass'
+
+    # --- optional: anomaly detection + imputation ---
+    if do_anomaly:
+        for key in ('anomaly', 'post_anomaly_interp', 'impute_anomaly'):
+            if key not in path_names:
+                raise KeyError(
+                    f"'{key}' path not detected in provided dictionary "
+                    f"(path_names). Required when do_anomaly=True."
+                )
+        detect_anomalies(
+            path_names[last], path_names['anomaly'],
+            sampling_rate,
+        )
+        post_anomaly_interp_signals(
+            path_names['anomaly'], path_names['post_anomaly_interp'],
+            sampling_rate,
+        )
+        impute_anomaly_signals(
+            path_names['post_anomaly_interp'], path_names['impute_anomaly'],
+            sampling_rate,
+        )
+        last = 'impute_anomaly'
+
+    # --- optional: smoothing ---
+    if do_smooth:
+        if 'smooth' not in path_names:
+            raise KeyError(
+                "'smooth' path not detected in provided dictionary "
+                "(path_names). Required when do_smooth=True."
+            )
+        gaussian_smooth_signals(
+            path_names[last], path_names['smooth'],
+            sampling_rate, sigma_seconds=sigma_seconds,
+        )
