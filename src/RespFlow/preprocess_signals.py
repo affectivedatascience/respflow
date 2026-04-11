@@ -356,42 +356,51 @@ def hard_fault_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # DETREND
+#
+#
 # =============================================================================
 #
 
-def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds: int = 60) -> tuple:
-    # 60-second window default based on BreathMetrics paper
+def _apply_detrend(
+    signal: np.ndarray,
+    sampling_rate: int,
+    window_size_seconds: int = 60, # 60-second window default based on BreathMetrics paper
+) -> tuple[np.ndarray, np.ndarray]:
+    """Subtract a rolling-median baseline from a 1-D signal."""
+    num_samples = len(signal)
+    signal_duration = num_samples / sampling_rate
+
     # if signal is shorter than window, use global median
-
-    W0 = window_size_seconds  # seconds
-    N = len(signal)
-    signal_duration = N / sampling_rate
-
-    use_rolling = (signal_duration >= W0)
-
-    if use_rolling:
-        k = seconds_to_samples(W0, sampling_rate)  # window length in samples
-        if k % 2 == 0:
-            k += 1
+    if signal_duration >= window_size_seconds:
+        window_samples = seconds_to_samples(window_size_seconds, sampling_rate)
+        
+        # rolling with center=True requires an odd window to be truly centered
+        if window_samples % 2 == 0: 
+            window_samples += 1
 
         # Guard: do not use a window longer than the signal
-        if k <= N:
+        if window_samples <= num_samples:
             s = pd.Series(signal)
 
             # NaN-safe centered rolling median baseline
+            # Require at least half the window to be filled before computing a median,
+            # so edge estimates aren't based on just a handful of samples. The max(1, ...)
+            # ensures min_periods is never 0 for very small windows.
             baseline = (
-                s.rolling(window=k, center=True, min_periods=max(1, k // 2))
+                s.rolling(window=window_samples, center=True, min_periods=max(1, window_samples // 2))
                 .median()
             )
 
             # If baseline has NaNs (edges or long NaN runs), fill from nearest valid values
             baseline = baseline.ffill().bfill().to_numpy()
         else:
-            baseline = np.full(N, np.nanmedian(signal))
+            baseline = np.full(num_samples, np.nanmedian(signal))
     else:
-        baseline = np.full(N, np.nanmedian(signal))
-
+        baseline = np.full(num_samples, np.nanmedian(signal))
 
     # Detrend
     detrended_signal = signal - baseline
@@ -399,21 +408,29 @@ def apply_detrend(signal: list | tuple, sampling_rate: int, window_size_seconds:
     return detrended_signal, baseline
 
 
-def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size_seconds: int = 60) -> None:
+def detrend_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    window_size_seconds: int = 60,
+) -> None:
     """
-    Applies detrending to all columns except 'time' in all CSV files.
-    Preserves the folder structure from in_path to out_path.
+    Apply rolling-median detrending to all signal columns in all CSV files.
 
-    Parameters:
-    -----------
+    Subtracts a rolling-median baseline from each non-time column and writes
+    the detrended data to ``out_path``, preserving folder structure.
+
+    Parameters
+    ----------
     in_path : str
-        Input directory path
+        Input directory path containing CSV files.
     out_path : str
-        Output directory path
-    sampling_rate : float
-        Sampling rate in Hz
+        Output directory path for detrended CSV files.
+    sampling_rate : int
+        Sampling rate in Hz.
     window_size_seconds : int, optional
-        Window size for median filter in seconds (default: 60)
+        Window size for the rolling median in seconds. Default 60.
+        If a signal is shorter than this window, a global median is used instead.
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -421,32 +438,28 @@ def detrend_signals(in_path: str, out_path: str, sampling_rate: int, window_size
     out_path_obj = Path(out_path)
 
     for file_path in mapped_files.values():
-        # Read the CSV file
         df = pd.read_csv(file_path)
 
-        # Apply detrending to all columns except 'time'
         for column in df.columns:
             if column.lower() != 'time':
-                detrended_signal, _ = apply_detrend(df[column].values, sampling_rate, window_size_seconds)
-                df[column] = detrended_signal
+                detrended, _ = _apply_detrend(df[column].values, sampling_rate, window_size_seconds)
+                df[column] = detrended
 
-        # Determine the relative path from in_path to preserve folder structure
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
-
-        # Create output path
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
-
-        # Create output directory if it doesn't exist
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Save the detrended data
         df.to_csv(output_file_path, index=False)
-
+    
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # MICRO INTERP
+#
+#
 # =============================================================================
 #
 
