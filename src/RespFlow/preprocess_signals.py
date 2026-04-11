@@ -1053,7 +1053,12 @@ def detect_anomalies(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
-# POST ANOMALY MICRO INTERP
+# =============================================================================
+#
+#
+# POST ANOMALY INTERP
+#
+#
 # =============================================================================
 #
 
@@ -1066,26 +1071,40 @@ def post_anomaly_interp_signals(
     breath_rate_hz: float = 0.25,
 ) -> None:
     """
-    Post-anomaly interpolation: fills larger NaN gaps (default 50% of one
-    breath cycle) after anomaly detection has NaN-ed out bad regions.
+    Fill medium-sized NaN gaps introduced by anomaly detection.
+
+    For every signal column that has a matching ``<column>_anomaly`` mask,
+    interpolates across anomaly-induced NaN runs up to a maximum gap size set
+    to ``percentage_fill`` of one breath cycle. Non-anomaly NaNs (e.g. hard-
+    fault gaps that were already present or NaNs present in raw stage) 
+    are preserved in the output.
 
     Parameters
     ----------
     in_path : str
-        Input directory path (typically the anomaly output).
+        Input directory path (typically the anomaly-detection output).
     out_path : str
-        Output directory path.
+        Output directory path for interpolated CSV files.
     sampling_rate : int
         Sampling rate in Hz.
     interp_method : str, optional
-        Interpolation method: "pchip" (default) or "cubic_spline".
+        Interpolation method: ``"pchip"`` (default) or ``"cubic_spline"``.
     percentage_fill : float, optional
-        Fraction of one breath cycle to fill. Default 0.5 (50%).
+        Fraction of one breath cycle that sets the maximum gap to fill.
+        Default 0.5 (50% of one cycle).
     breath_rate_hz : float, optional
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
+
+    Returns
+    -------
+    None
     """
     mapped_files = map_files(in_path, file_ext='csv')
-    max_gap = _default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
+    max_gap = _default_max_gap(
+        sampling_rate,
+        percentage_fill=percentage_fill,
+        breath_rate_hz=breath_rate_hz,
+    )
 
     in_path_obj = Path(in_path)
     out_path_obj = Path(out_path)
@@ -1123,8 +1142,7 @@ def post_anomaly_interp_signals(
             filled[non_anomaly_nans] = np.nan
             df[column] = filled
 
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_file_path, index=False)
