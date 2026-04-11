@@ -580,8 +580,7 @@ def _apply_micro_interp(
     signal = np.asarray(signal, dtype=float)
     max_gap = _default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
     
-    # Original mask not needed for first interpolation, but it will be used in
-    # post_anomaly_interp_signals
+    # mask not needed here
     filled, _ = _interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
     return filled
 
@@ -1089,7 +1088,7 @@ def post_anomaly_interp_signals(
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
     """
     mapped_files = map_files(in_path, file_ext='csv')
-    max_gap = default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
+    max_gap = _default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
 
     in_path_obj = Path(in_path)
     out_path_obj = Path(out_path)
@@ -1121,7 +1120,7 @@ def post_anomaly_interp_signals(
                         np.where(non_anomaly_nans)[0], valid, signal[valid]
                     )
 
-            filled, _ = interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
+            filled, _ = _interpolate_nan_gaps(signal, method=interp_method, max_gap=max_gap)
 
             # Restore non-anomaly NaNs
             filled[non_anomaly_nans] = np.nan
@@ -1363,7 +1362,7 @@ def cycle_synthesis_impute(
     x_filled = x.copy()
     mask_imputed = np.zeros(len(x), dtype=bool)
 
-    gaps = nan_gap_indices(x_filled)
+    gaps = _nan_gap_indices(x_filled)
 
     # Only process gaps that overlap the anomaly mask
     if anomaly_mask is not None:
