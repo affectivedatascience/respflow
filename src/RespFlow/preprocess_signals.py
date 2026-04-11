@@ -641,45 +641,50 @@ def detrend_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # BANDPASS
+#
+#
 # =============================================================================
 #
 
-def apply_bandpass(data: list | tuple, sampling_rate: int, lowcut: float = 0.05, highcut: float = 2.0, order: int = 2) -> list | tuple:
-    """
-    Applies a zero-phase Butterworth bandpass filter.
-    Standard: 0.05-2.0 Hz for RIP belt data.
-    """
+def _apply_bandpass(
+    signal: np.ndarray,
+    sampling_rate: int,
+    lowcut: float = 0.05,
+    highcut: float = 2.0,
+    order: int = 2,
+) -> np.ndarray:
+    """Apply a zero-phase Butterworth bandpass filter to a 1-D signal."""
     nyquist = 0.5 * sampling_rate
-    low = lowcut / nyquist
+    
+    # normalise to [0, 1] as required by butter
+    low = lowcut / nyquist 
     high = highcut / nyquist
 
     # Design filter
     sos = butter(order, [low, high], btype='band', output='sos')
 
-    # Apply zero-phase filter (filtfilt) with padlen adjusted for short signals
-    padlen = min(len(data) - 1, 15)
-    y = sosfiltfilt(sos, data, padlen=padlen)
+    # Apply zero-phase filter (sosfiltfilt) with padlen adjusted for short signals
+    padlen = min(len(signal) - 1, 15)
+    y = sosfiltfilt(sos, signal, padlen=padlen)
 
     return y
 
 
-def min_viable_length_sosfiltfilt(
+def _min_viable_length_sosfiltfilt(
     sampling_rate: int,
     lowcut: float = 0.05,
     highcut: float = 2.0,
     order: int = 2,
 ) -> dict:
     """
-    Compute the SciPy sosfiltfilt *default* padlen for a Butterworth bandpass and
-    return the minimum viable segment length N_min such that padlen < N-1.
+    Compute SciPy's default ``padlen`` for a Butterworth bandpass and the
+    minimum segment length ``N_min`` such that ``padlen < N - 1``.
 
-    Returns:
-        {
-          "n_sections": int,
-          "padlen_default": int,
-          "min_sequence_length": int
-        }
+    Return dict keys: ``n_sections``, ``padlen_default``, ``min_sequence_length``.
     """
     nyquist = 0.5 * sampling_rate
     low = lowcut / nyquist
@@ -705,7 +710,7 @@ def min_viable_length_sosfiltfilt(
     }
 
 
-def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
+def _nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
     """
     Return (start, end) index pairs for contiguous non-NaN regions ("islands")
     in a 1D array x. Indices are half-open: [start, end).
@@ -714,19 +719,19 @@ def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
     """
     x = np.asarray(x)
     if x.ndim != 1:
-        raise ValueError("nan_islands expects a 1D array")
+        raise ValueError("_nan_islands expects a 1D array")
 
     valid = ~np.isnan(x)
 
     # Find rising edges (False->True) and falling edges (True->False)
     d = np.diff(valid.astype(np.int8))
     starts = np.where(d == 1)[0] + 1
-    ends   = np.where(d == -1)[0] + 1
+    ends = np.where(d == -1)[0] + 1
 
     # Handle island starting at index 0
     if valid[0]:
         starts = np.r_[0, starts]
-
+    
     # Handle island ending at last index
     if valid[-1]:
         ends = np.r_[ends, len(x)]
@@ -734,51 +739,43 @@ def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(starts.tolist(), ends.tolist()))
 
 
-def iter_nan_islands(x: np.ndarray):
-    """
-    Generator yielding (start, end, segment) for each non-NaN island.
-    """
+def _iter_nan_islands(x: np.ndarray) -> Iterator[tuple[int, int, np.ndarray]]:
+    """Yield ``(start, end, segment)`` for each contiguous non-NaN run in a 1-D array."""
     x = np.asarray(x)
-    for start, end in nan_islands(x):
+    for start, end in _nan_islands(x):
         yield start, end, x[start:end]
 
 
-def apply_bandpass_nan_safe(
-    data: np.ndarray,
+def _apply_bandpass_nan_safe(
+    signal: np.ndarray,
     sampling_rate: int,
-    lowcut: float,
-    highcut: float,
-    order: int,
+    lowcut: float = 0.05,
+    highcut: float = 2.0,
+    order: int = 2,
 ) -> np.ndarray:
     """
-    NaN-safe bandpass filter.
+    Bandpass filter a signal that may contain NaNs.
 
-    If the signal has no NaNs, filters directly. If NaNs remain (e.g. large
-    unfilled gaps), filters each contiguous non-NaN island separately.
-
-    Parameters:
-        data: Input signal (may contain NaN)
-        sampling_rate, lowcut, highcut, order: Filter parameters
+    If no NaNs are present, filters directly. Otherwise filters each contiguous
+    non-NaN island separately and leaves NaN regions untouched.
     """
-    data = np.asarray(data, dtype=float)
+    signal = np.asarray(signal, dtype=float)
 
     # Fast path: no NaNs
-    if not np.any(np.isnan(data)):
-        return apply_bandpass(data, sampling_rate, lowcut, highcut, order)
+    if not np.any(np.isnan(signal)):
+        return _apply_bandpass(signal, sampling_rate, lowcut, highcut, order)
 
     # NaNs present — filter each non-NaN island separately
-    min_len = min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
-    result = np.full_like(data, np.nan)
+    min_len = _min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
+    result = np.full_like(signal, np.nan)
 
-    for start, end, segment in iter_nan_islands(data):
+    for start, end, segment in _iter_nan_islands(signal):
         if len(segment) >= min_len:
-            result[start:end] = apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
+            result[start:end] = _apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
 
     return result
 
 
-# Strictly needs path_names (raw files), and sampling rate
-# optional is upper and lower frequency for bandpass filter
 def bandpass_filter_signals(
     in_path: str,
     out_path: str,
@@ -787,42 +784,49 @@ def bandpass_filter_signals(
     order: int = 2,
 ) -> None:
     """
-    Applies a Butterworth bandpass filter to all columns except 'time' in all CSV files.
-    Preserves the folder structure from in_path to out_path.
+    Apply a Butterworth bandpass filter to all signal columns in all CSV files.
 
-    Parameters:
-    -----------
+    Filters every non-time column of each CSV under ``in_path`` and writes the
+    results to ``out_path``, preserving folder structure. Filtering is NaN-safe:
+    contiguous non-NaN runs are filtered independently and NaN regions are left
+    untouched.
+
+    Parameters
+    ----------
     in_path : str
-        Input directory path
+        Input directory path containing CSV files.
     out_path : str
-        Output directory path
-    sampling_rate : float
-        Sampling rate in Hz
+        Output directory path for bandpass-filtered CSV files.
+    sampling_rate : int
+        Sampling rate in Hz.
     passband : str or tuple, optional
-        Preset name or tuple of (lowcut, highcut) in Hz.
-        Presets: 'default' (0.05-2.0 Hz), 'resting_adult' (0.05-1.0 Hz),
-        'narrow_band' (0.1-0.35 Hz), 'wide_band' (0.05-3.0 Hz).
-        Default: 'default'
+        Preset name or an explicit ``(lowcut, highcut)`` tuple in Hz. Presets:
+        ``'default'`` (0.05-2.0 Hz), ``'resting_adult'`` (0.05-1.0 Hz),
+        ``'narrow_band'`` (0.1-0.35 Hz), ``'wide_band'`` (0.05-3.0 Hz).
+        Default ``'default'``.
     order : int, optional
-        Filter order (default: 2)
+        Butterworth filter order. Default 2.
+
+    Returns
+    -------
+    None
     """
     PASSBANDS = {
         'default': (0.05, 2.0),
         'resting_adult': (0.05, 1),
         'narrow_band': (0.1, 0.35),
-        'wide_band': (0.05, 3.0)
+        'wide_band': (0.05, 3.0),
     }
     
     # Determine lowcut and highcut from passband argument
     if isinstance(passband, str):
-        if passband in PASSBANDS:
-            lowcut, highcut = PASSBANDS[passband]
-        else:
+        if passband not in PASSBANDS:
             raise ValueError(f"Unknown passband preset '{passband}'. Available: {list(PASSBANDS.keys())}")
+        lowcut, highcut = PASSBANDS[passband]
     elif isinstance(passband, (tuple, list)) and len(passband) == 2:
         lowcut, highcut = passband
     else:
-        raise ValueError("passband must be a string preset or a tuple of (lowcut, highcut)")
+        raise ValueError("passband must be a string preset or a (lowcut, highcut) tuple")
 
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -830,25 +834,18 @@ def bandpass_filter_signals(
     out_path_obj = Path(out_path)
 
     for file_path in mapped_files.values():
-        # Read the CSV file
         df = pd.read_csv(file_path)
 
-        # Apply bandpass filter to all columns except 'time'
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_bandpass_nan_safe(df[column].values, sampling_rate, lowcut, highcut, order)
+                df[column] = _apply_bandpass_nan_safe(
+                    df[column].values, sampling_rate, lowcut, highcut, order
+                )
 
-        # Determine the relative path from in_path to preserve folder structure
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
-
-        # Create output path
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
-
-        # Create output directory if it doesn't exist
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Save the filtered data
         df.to_csv(output_file_path, index=False)
 
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
