@@ -2,6 +2,7 @@ from RespFlow.access_files import map_files
 from scipy.signal import butter, sosfiltfilt, find_peaks
 from scipy.interpolate import PchipInterpolator, CubicSpline
 from scipy.ndimage import binary_closing, gaussian_filter1d
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 import pandas as pd
@@ -641,45 +642,50 @@ def detrend_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # BANDPASS
+#
+#
 # =============================================================================
 #
 
-def apply_bandpass(data: list | tuple, sampling_rate: int, lowcut: float = 0.05, highcut: float = 2.0, order: int = 2) -> list | tuple:
-    """
-    Applies a zero-phase Butterworth bandpass filter.
-    Standard: 0.05-2.0 Hz for RIP belt data.
-    """
+def _apply_bandpass(
+    signal: np.ndarray,
+    sampling_rate: int,
+    lowcut: float = 0.05,
+    highcut: float = 2.0,
+    order: int = 2,
+) -> np.ndarray:
+    """Apply a zero-phase Butterworth bandpass filter to a 1-D signal."""
     nyquist = 0.5 * sampling_rate
-    low = lowcut / nyquist
+    
+    # normalise to [0, 1] as required by butter
+    low = lowcut / nyquist 
     high = highcut / nyquist
 
     # Design filter
     sos = butter(order, [low, high], btype='band', output='sos')
 
-    # Apply zero-phase filter (filtfilt) with padlen adjusted for short signals
-    padlen = min(len(data) - 1, 15)
-    y = sosfiltfilt(sos, data, padlen=padlen)
+    # Apply zero-phase filter (sosfiltfilt) with padlen adjusted for short signals
+    padlen = min(len(signal) - 1, 15)
+    y = sosfiltfilt(sos, signal, padlen=padlen)
 
     return y
 
 
-def min_viable_length_sosfiltfilt(
+def _min_viable_length_sosfiltfilt(
     sampling_rate: int,
     lowcut: float = 0.05,
     highcut: float = 2.0,
     order: int = 2,
 ) -> dict:
     """
-    Compute the SciPy sosfiltfilt *default* padlen for a Butterworth bandpass and
-    return the minimum viable segment length N_min such that padlen < N-1.
+    Compute SciPy's default ``padlen`` for a Butterworth bandpass and the
+    minimum segment length ``N_min`` such that ``padlen < N - 1``.
 
-    Returns:
-        {
-          "n_sections": int,
-          "padlen_default": int,
-          "min_sequence_length": int
-        }
+    Return dict keys: ``n_sections``, ``padlen_default``, ``min_sequence_length``.
     """
     nyquist = 0.5 * sampling_rate
     low = lowcut / nyquist
@@ -705,7 +711,7 @@ def min_viable_length_sosfiltfilt(
     }
 
 
-def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
+def _nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
     """
     Return (start, end) index pairs for contiguous non-NaN regions ("islands")
     in a 1D array x. Indices are half-open: [start, end).
@@ -714,19 +720,19 @@ def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
     """
     x = np.asarray(x)
     if x.ndim != 1:
-        raise ValueError("nan_islands expects a 1D array")
+        raise ValueError("_nan_islands expects a 1D array")
 
     valid = ~np.isnan(x)
 
     # Find rising edges (False->True) and falling edges (True->False)
     d = np.diff(valid.astype(np.int8))
     starts = np.where(d == 1)[0] + 1
-    ends   = np.where(d == -1)[0] + 1
+    ends = np.where(d == -1)[0] + 1
 
     # Handle island starting at index 0
     if valid[0]:
         starts = np.r_[0, starts]
-
+    
     # Handle island ending at last index
     if valid[-1]:
         ends = np.r_[ends, len(x)]
@@ -734,51 +740,43 @@ def nan_islands(x: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(starts.tolist(), ends.tolist()))
 
 
-def iter_nan_islands(x: np.ndarray):
-    """
-    Generator yielding (start, end, segment) for each non-NaN island.
-    """
+def _iter_nan_islands(x: np.ndarray) -> Iterator[tuple[int, int, np.ndarray]]:
+    """Yield ``(start, end, segment)`` for each contiguous non-NaN run in a 1-D array."""
     x = np.asarray(x)
-    for start, end in nan_islands(x):
+    for start, end in _nan_islands(x):
         yield start, end, x[start:end]
 
 
-def apply_bandpass_nan_safe(
-    data: np.ndarray,
+def _apply_bandpass_nan_safe(
+    signal: np.ndarray,
     sampling_rate: int,
-    lowcut: float,
-    highcut: float,
-    order: int,
+    lowcut: float = 0.05,
+    highcut: float = 2.0,
+    order: int = 2,
 ) -> np.ndarray:
     """
-    NaN-safe bandpass filter.
+    Bandpass filter a signal that may contain NaNs.
 
-    If the signal has no NaNs, filters directly. If NaNs remain (e.g. large
-    unfilled gaps), filters each contiguous non-NaN island separately.
-
-    Parameters:
-        data: Input signal (may contain NaN)
-        sampling_rate, lowcut, highcut, order: Filter parameters
+    If no NaNs are present, filters directly. Otherwise filters each contiguous
+    non-NaN island separately and leaves NaN regions untouched.
     """
-    data = np.asarray(data, dtype=float)
+    signal = np.asarray(signal, dtype=float)
 
     # Fast path: no NaNs
-    if not np.any(np.isnan(data)):
-        return apply_bandpass(data, sampling_rate, lowcut, highcut, order)
+    if not np.any(np.isnan(signal)):
+        return _apply_bandpass(signal, sampling_rate, lowcut, highcut, order)
 
     # NaNs present — filter each non-NaN island separately
-    min_len = min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
-    result = np.full_like(data, np.nan)
+    min_len = _min_viable_length_sosfiltfilt(sampling_rate, lowcut, highcut, order)["min_sequence_length"]
+    result = np.full_like(signal, np.nan)
 
-    for start, end, segment in iter_nan_islands(data):
+    for start, end, segment in _iter_nan_islands(signal):
         if len(segment) >= min_len:
-            result[start:end] = apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
+            result[start:end] = _apply_bandpass(segment, sampling_rate, lowcut, highcut, order)
 
     return result
 
 
-# Strictly needs path_names (raw files), and sampling rate
-# optional is upper and lower frequency for bandpass filter
 def bandpass_filter_signals(
     in_path: str,
     out_path: str,
@@ -787,42 +785,49 @@ def bandpass_filter_signals(
     order: int = 2,
 ) -> None:
     """
-    Applies a Butterworth bandpass filter to all columns except 'time' in all CSV files.
-    Preserves the folder structure from in_path to out_path.
+    Apply a Butterworth bandpass filter to all signal columns in all CSV files.
 
-    Parameters:
-    -----------
+    Filters every non-time column of each CSV under ``in_path`` and writes the
+    results to ``out_path``, preserving folder structure. Filtering is NaN-safe:
+    contiguous non-NaN runs are filtered independently and NaN regions are left
+    untouched.
+
+    Parameters
+    ----------
     in_path : str
-        Input directory path
+        Input directory path containing CSV files.
     out_path : str
-        Output directory path
-    sampling_rate : float
-        Sampling rate in Hz
+        Output directory path for bandpass-filtered CSV files.
+    sampling_rate : int
+        Sampling rate in Hz.
     passband : str or tuple, optional
-        Preset name or tuple of (lowcut, highcut) in Hz.
-        Presets: 'default' (0.05-2.0 Hz), 'resting_adult' (0.05-1.0 Hz),
-        'narrow_band' (0.1-0.35 Hz), 'wide_band' (0.05-3.0 Hz).
-        Default: 'default'
+        Preset name or an explicit ``(lowcut, highcut)`` tuple in Hz. Presets:
+        ``'default'`` (0.05-2.0 Hz), ``'resting_adult'`` (0.05-1.0 Hz),
+        ``'narrow_band'`` (0.1-0.35 Hz), ``'wide_band'`` (0.05-3.0 Hz).
+        Default ``'default'``.
     order : int, optional
-        Filter order (default: 2)
+        Butterworth filter order. Default 2.
+
+    Returns
+    -------
+    None
     """
     PASSBANDS = {
         'default': (0.05, 2.0),
         'resting_adult': (0.05, 1),
         'narrow_band': (0.1, 0.35),
-        'wide_band': (0.05, 3.0)
+        'wide_band': (0.05, 3.0),
     }
     
     # Determine lowcut and highcut from passband argument
     if isinstance(passband, str):
-        if passband in PASSBANDS:
-            lowcut, highcut = PASSBANDS[passband]
-        else:
+        if passband not in PASSBANDS:
             raise ValueError(f"Unknown passband preset '{passband}'. Available: {list(PASSBANDS.keys())}")
+        lowcut, highcut = PASSBANDS[passband]
     elif isinstance(passband, (tuple, list)) and len(passband) == 2:
         lowcut, highcut = passband
     else:
-        raise ValueError("passband must be a string preset or a tuple of (lowcut, highcut)")
+        raise ValueError("passband must be a string preset or a (lowcut, highcut) tuple")
 
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -830,151 +835,125 @@ def bandpass_filter_signals(
     out_path_obj = Path(out_path)
 
     for file_path in mapped_files.values():
-        # Read the CSV file
         df = pd.read_csv(file_path)
 
-        # Apply bandpass filter to all columns except 'time'
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_bandpass_nan_safe(df[column].values, sampling_rate, lowcut, highcut, order)
+                df[column] = _apply_bandpass_nan_safe(
+                    df[column].values, sampling_rate, lowcut, highcut, order
+                )
 
-        # Determine the relative path from in_path to preserve folder structure
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
-
-        # Create output path
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
-
-        # Create output directory if it doesn't exist
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Save the filtered data
         df.to_csv(output_file_path, index=False)
 
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # ANOMALY DETECTION
+#
+#
 # =============================================================================
 #
 
-def detect_anomalies_iqr(signal_series, window_size=60_000):
-    # Calculate rolling Q1 (25th percentile) and Q3 (75th percentile)
+def _detect_anomalies_iqr(
+    signal_series: pd.Series,
+    window_size: int = 60_000,
+) -> pd.Series:
+    """Flag samples outside the rolling IQR (1.5 * IQR) as anomalies."""
     rolling_q1 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.25)
     rolling_q3 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.75)
-    
-    # Calculate rolling IQR
     rolling_iqr = rolling_q3 - rolling_q1
-    
-    # Define dynamic upper and lower bounds
-    lower_bound = rolling_q1 - (1.5 * rolling_iqr)
-    upper_bound = rolling_q3 + (1.5 * rolling_iqr)
-    
-    # Flag points outside the bounds
+
+    lower_bound = rolling_q1 - 1.5 * rolling_iqr
+    upper_bound = rolling_q3 + 1.5 * rolling_iqr
+
     anomalies = (signal_series < lower_bound) | (signal_series > upper_bound)
-    
-    # Fill NaN values created by the rolling window at the edges
     return anomalies.fillna(False)
 
 
-def detect_anomalies_zscore(signal_series, window_size=60_000, z_threshold=2.0):
-    # Calculate rolling mean and standard deviation
+def _detect_anomalies_zscore(
+    signal_series: pd.Series,
+    window_size: int = 60_000,
+    z_threshold: float = 2.0,
+) -> pd.Series:
+    """Flag samples more than ``z_threshold`` standard deviations from the rolling mean."""
     rolling_mean = signal_series.rolling(window=window_size, center=True, min_periods=1).mean()
     rolling_std = signal_series.rolling(window=window_size, center=True, min_periods=1).std()
     
-    # Calculate the Z-score for each point
-    z_scores = (signal_series - rolling_mean) / rolling_std
+    z_scores = (signal_series - rolling_mean) / rolling_std.replace(0, np.nan)
     
-    # Flag points where the absolute Z-score exceeds the threshold
     anomalies = np.abs(z_scores) > z_threshold
-    
-    # Fill NaN values at the edges
     return anomalies.fillna(False)
 
 
-def detect_anomalies_energy_ratio(signal_series, short_window=8_000, long_window=60_000,
-                                   upper_ratio=3.0, lower_ratio=0.1):
+def _detect_anomalies_energy_ratio(
+    signal_series: pd.Series,
+    short_window: int = 8_000,
+    long_window: int = 60_000,
+    upper_ratio: float = 3.0,
+    lower_ratio: float = 0.1,
+) -> pd.Series:
     """
-    Flags regions where local energy deviates from the longer-term baseline.
+    Flag samples where the short-to-long rolling variance ratio departs from 1.
 
-    Compares short-term rolling variance to long-term rolling variance.
-    ratio >> 1  →  local burst  (motion, cough, artifact)
-    ratio << 1  →  local quiescence  (apnea, signal dropout)
-
-    Parameters
-    ----------
-    signal_series : pd.Series
-    short_window : int
-        Short-term variance window in samples.  Must span at least ~2 breath
-        cycles so that normal sinusoidal oscillation averages out.
-        Default 8000 = 4 s at 2000 Hz (~2 breaths at 0.25 Hz).
-    long_window : int
-        Long-term variance window in samples (default 60000 = 30 s at 2000 Hz).
-    upper_ratio : float
-        Flag where ratio exceeds this (energy burst). Default 3.0.
-    lower_ratio : float
-        Flag where ratio falls below this (energy drop). Default 0.1.
+    A ratio far above 1 indicates a local energy burst (motion, cough, artifact);
+    a ratio far below 1 indicates local quiescence (apnea, signal dropout).
     """
+    long_window = max(long_window, short_window + 1)
     short_var = signal_series.rolling(window=short_window, center=True, min_periods=1).var()
     long_var = signal_series.rolling(window=long_window, center=True, min_periods=1).var()
 
-    # Avoid division by zero — where long_var is ~0 the signal is essentially
-    # flatlined, which is itself anomalous
+    # Where long_var is ~0 the signal is flatlined, which is itself anomalous.
     ratio = short_var / long_var.replace(0, np.nan)
 
     anomalies = (ratio > upper_ratio) | (ratio < lower_ratio)
     return anomalies.fillna(False)
 
 
-def detect_anomalies_ensemble(signal_series, window_size=60_000, min_votes=2):
-    """
-    Combines IQR, Z-Score, and Energy-Ratio methods to find anomalies.
-    Requires at least 'min_votes' methods to flag a point as True.
-    """
-    iqr_flags = detect_anomalies_iqr(signal_series, window_size=window_size)
-    zscore_flags = detect_anomalies_zscore(signal_series, window_size=window_size)
-    energy_flags = detect_anomalies_energy_ratio(signal_series, long_window=window_size)
+def _detect_anomalies_ensemble(
+    signal_series: pd.Series,
+    window_size: int = 60_000,
+    min_votes: int = 2,
+    z_threshold: float = 2.0,
+) -> np.ndarray:
+    """Combine IQR / Z-score / energy-ratio detectors and flag samples with at least ``min_votes``."""
+    iqr_flags = _detect_anomalies_iqr(signal_series, window_size=window_size)
+    zscore_flags = _detect_anomalies_zscore(signal_series, window_size=window_size, z_threshold=z_threshold)
+    energy_flags = _detect_anomalies_energy_ratio(signal_series, long_window=window_size)
 
-    total_votes = iqr_flags.astype(int) + zscore_flags.astype(int) + energy_flags.astype(int)
+    total_votes = iqr_flags.to_numpy(dtype=int) + zscore_flags.to_numpy(dtype=int) + energy_flags.to_numpy(dtype=int)
 
     ensemble_anomalies = total_votes >= min_votes
     return ensemble_anomalies   
 
-def merge_close_anomalies(anomaly_mask, max_gap_samples=6000):
-    """
-    Merges anomaly blocks that are separated by fewer than 'max_gap_samples'.
-    """
-    # Create a structural element of ones (the size of the allowed gap)
-    structure = np.ones(max_gap_samples)
+def _merge_close_anomalies(
+    anomaly_mask: np.ndarray,
+    max_gap_samples: int = 6000,
+) -> np.ndarray:
+    """Merge anomaly runs separated by fewer than ``max_gap_samples`` samples via binary closing."""
+    structure = np.ones(max_gap_samples, dtype=bool)
 
-    # Run the closing operation
-    # It will turn [True, False, False, True] into [True, True, True, True]
+    # Binary closing bridges anomaly runs separated by fewer than max_gap_samples.
     merged_mask = binary_closing(anomaly_mask, structure=structure)
 
     return merged_mask
 
 
-def pad_anomaly_mask(anomaly_mask, pad_samples):
-    """
-    Expands each contiguous anomaly region by a fixed number of samples
-    on each side, clamped to the array bounds.
-
-    Parameters
-    ----------
-    anomaly_mask : array-like of bool
-        Boolean mask where True indicates an anomalous sample.
-    pad_samples : int
-        Number of samples to add on each side of every anomaly block.
-
-    Returns
-    -------
-    padded : np.ndarray of bool
-    """
+def _pad_anomaly_mask(
+    anomaly_mask: np.ndarray,
+    pad_samples: int,
+) -> np.ndarray:
+    """Expand each contiguous anomaly run by ``pad_samples`` on each side, clamped to array bounds."""
     mask = np.asarray(anomaly_mask, dtype=bool)
     padded = mask.copy()
     n = len(mask)
 
-    # Find starts and ends of contiguous True runs
     diff = np.diff(np.concatenate(([False], mask, [False])).astype(int))
     starts = np.where(diff == 1)[0]
     ends = np.where(diff == -1)[0]
@@ -991,12 +970,19 @@ def detect_anomalies(
     sampling_rate: int,
     window_size_seconds: float = 30,
     min_votes: int = 2,
+    z_threshold: float = 2.0,
     merge_gap_seconds: float = 1,
     pad_seconds: float = 2.5,
 ) -> None:
     """
-    Detects anomalies using an ensemble of IQR, Z-Score, and Energy-Ratio
-    methods, and replaces flagged points with NaN.
+    Detect anomalies in all signal columns via an ensemble of detectors.
+
+    Runs an IQR / Z-score / energy-ratio ensemble on every non-time column of
+    each CSV under ``in_path``. Samples flagged by at least ``min_votes``
+    detectors are marked anomalous. Anomaly runs closer than
+    ``merge_gap_seconds`` are merged, each run is padded by ``pad_seconds`` on
+    each side, and the flagged samples in the original column are replaced with
+    NaN. The boolean mask is stored alongside each column as ``<column>_anomaly``.
 
     Parameters
     ----------
@@ -1007,14 +993,21 @@ def detect_anomalies(
     sampling_rate : int
         Sampling rate in Hz.
     window_size_seconds : float, optional
-        Rolling window size in seconds for detection methods (default: 30).
+        Rolling window size in seconds for the detectors. Default 30.
     min_votes : int, optional
-        Minimum number of methods that must flag a point (default: 2).
+        Minimum number of detectors that must flag a sample. Default 2.
+    z_threshold : float, optional
+        Number of standard deviations from the rolling mean to flag as anomalous. Default 2.0.
     merge_gap_seconds : float, optional
-        Maximum gap in seconds between anomaly blocks to merge (default: 0, no merging).
+        Maximum gap in seconds between anomaly runs to merge. Default 1.
+        Set to 0 to disable merging.
     pad_seconds : float, optional
-        Seconds of padding to add on each side of every anomaly block.
-        Default 0 disables padding.
+        Seconds of padding to add on each side of every anomaly run. Default 2.5.
+        Set to 0 to disable padding.
+
+    Returns
+    -------
+    None
     """
     window_samples = seconds_to_samples(window_size_seconds, sampling_rate)
     merge_gap_samples = seconds_to_samples(merge_gap_seconds, sampling_rate)
@@ -1030,24 +1023,23 @@ def detect_anomalies(
 
         for column in df.columns:
             if column.lower() != 'time':
-                mask = detect_anomalies_ensemble(
+                mask = _detect_anomalies_ensemble(
                     df[column],
                     window_size=window_samples,
                     min_votes=min_votes,
+                    z_threshold=z_threshold,
                 )
 
                 if merge_gap_samples > 0:
-                    mask = merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
+                    mask = _merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
 
                 if pad_samples > 0:
-                    mask = pad_anomaly_mask(mask, pad_samples=pad_samples)
+                    mask = _pad_anomaly_mask(mask, pad_samples=pad_samples)
 
                 df[f'{column}_anomaly'] = mask
                 df.loc[mask, column] = np.nan
 
-        # Preserve folder structure
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1056,7 +1048,12 @@ def detect_anomalies(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
-# POST ANOMALY MICRO INTERP
+# =============================================================================
+#
+#
+# POST ANOMALY INTERP
+#
+#
 # =============================================================================
 #
 
@@ -1069,26 +1066,40 @@ def post_anomaly_interp_signals(
     breath_rate_hz: float = 0.25,
 ) -> None:
     """
-    Post-anomaly interpolation: fills larger NaN gaps (default 50% of one
-    breath cycle) after anomaly detection has NaN-ed out bad regions.
+    Fill medium-sized NaN gaps introduced by anomaly detection.
+
+    For every signal column that has a matching ``<column>_anomaly`` mask,
+    interpolates across anomaly-induced NaN runs up to a maximum gap size set
+    to ``percentage_fill`` of one breath cycle. Non-anomaly NaNs (e.g. hard-
+    fault gaps that were already present or NaNs present in raw stage) 
+    are preserved in the output.
 
     Parameters
     ----------
     in_path : str
-        Input directory path (typically the anomaly output).
+        Input directory path (typically the anomaly-detection output).
     out_path : str
-        Output directory path.
+        Output directory path for interpolated CSV files.
     sampling_rate : int
         Sampling rate in Hz.
     interp_method : str, optional
-        Interpolation method: "pchip" (default) or "cubic_spline".
+        Interpolation method: ``"pchip"`` (default) or ``"cubic_spline"``.
     percentage_fill : float, optional
-        Fraction of one breath cycle to fill. Default 0.5 (50%).
+        Fraction of one breath cycle that sets the maximum gap to fill.
+        Default 0.5 (50% of one cycle).
     breath_rate_hz : float, optional
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
+
+    Returns
+    -------
+    None
     """
     mapped_files = map_files(in_path, file_ext='csv')
-    max_gap = _default_max_gap(sampling_rate, percentage_fill=percentage_fill, breath_rate_hz=breath_rate_hz)
+    max_gap = _default_max_gap(
+        sampling_rate,
+        percentage_fill=percentage_fill,
+        breath_rate_hz=breath_rate_hz,
+    )
 
     in_path_obj = Path(in_path)
     out_path_obj = Path(out_path)
@@ -1126,8 +1137,7 @@ def post_anomaly_interp_signals(
             filled[non_anomaly_nans] = np.nan
             df[column] = filled
 
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_file_path, index=False)
@@ -1541,88 +1551,84 @@ def impute_anomaly_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # GAUSSIAN SMOOTH
+#
+#
 # =============================================================================
 #
 
-def apply_gaussian_smooth(data: np.ndarray, sampling_rate: int, sigma_seconds: float = 0.05) -> np.ndarray:
-    """
-    Apply Gaussian smoothing to a 1D signal.
-
-    Parameters
-    ----------
-    data : np.ndarray
-        1D input signal (must not contain NaN).
-    sampling_rate : int
-        Sampling rate in Hz.
-    sigma_seconds : float, optional
-        Standard deviation of the Gaussian kernel in seconds (default: 0.05).
-
-    Returns
-    -------
-    np.ndarray
-        Smoothed signal, same length as input.
-    """
+def _apply_gaussian_smooth(
+    signal: np.ndarray,
+    sampling_rate: int,
+    sigma_seconds: float = 0.05,
+) -> np.ndarray:
+    """Apply a Gaussian smoothing filter (σ in seconds) to a 1-D signal."""
     sigma_samples = seconds_to_samples(sigma_seconds, sampling_rate)
     if sigma_samples < 1:
         sigma_samples = 1
-    return gaussian_filter1d(data, sigma=sigma_samples)
+    return gaussian_filter1d(signal, sigma=sigma_samples)
 
 
-def apply_gaussian_smooth_nan_safe(data: np.ndarray, sampling_rate: int, sigma_seconds: float = 0.05) -> np.ndarray:
+def _apply_gaussian_smooth_nan_safe(
+    signal: np.ndarray,
+    sampling_rate: int,
+    sigma_seconds: float = 0.05,
+) -> np.ndarray:
     """
-    NaN-safe Gaussian smoothing.
+    Gaussian-smooth a signal that may contain NaNs.
 
-    If the signal has no NaNs, smooths directly. If NaNs remain (e.g. large
-    unfilled gaps), smooths each contiguous non-NaN island separately.
-
-    Parameters
-    ----------
-    data : np.ndarray
-        1D input signal (may contain NaN).
-    sampling_rate : int
-        Sampling rate in Hz.
-    sigma_seconds : float, optional
-        Standard deviation of the Gaussian kernel in seconds (default: 0.05).
-
-    Returns
-    -------
-    np.ndarray
-        Smoothed signal with NaN positions preserved.
+    If no NaNs are present, smooths directly. Otherwise smooths each contiguous
+    non-NaN island separately and leaves NaN regions untouched.
     """
-    data = np.asarray(data, dtype=float)
+    signal = np.asarray(signal, dtype=float)
 
     # Fast path: no NaNs
-    if not np.any(np.isnan(data)):
-        return apply_gaussian_smooth(data, sampling_rate, sigma_seconds)
+    if not np.any(np.isnan(signal)):
+        return _apply_gaussian_smooth(signal, sampling_rate, sigma_seconds)
 
-    # NaNs present -- smooth each non-NaN island separately
+    # NaNs present: smooth each non-NaN island separately
     sigma_samples = seconds_to_samples(sigma_seconds, sampling_rate)
-    min_len = max(2 * sigma_samples + 1, 3)
-    result = np.full_like(data, np.nan)
+    min_len = max(2 * sigma_samples + 1, 3) # floor of 3: minimum samples for smoothing to be meaningful
+    result = np.full_like(signal, np.nan)
 
-    for start, end, segment in iter_nan_islands(data):
+    for start, end, segment in _iter_nan_islands(signal):
         if len(segment) >= min_len:
-            result[start:end] = apply_gaussian_smooth(segment, sampling_rate, sigma_seconds)
+            result[start:end] = _apply_gaussian_smooth(segment, sampling_rate, sigma_seconds)
 
     return result
 
 
-def gaussian_smooth_signals(in_path: str, out_path: str, sampling_rate: int, sigma_seconds: float = 0.05) -> None:
+def gaussian_smooth_signals(
+    in_path: str,
+    out_path: str,
+    sampling_rate: int,
+    sigma_seconds: float = 0.05,
+) -> None:
     """
-    Applies Gaussian smoothing to all columns except 'time' in all CSV files.
-    Preserves the folder structure from in_path to out_path.
+    Apply Gaussian smoothing to all signal columns in all CSV files.
 
-    Parameters:
-    -----------
+    Smooths every non-time column of each CSV under ``in_path`` and writes the
+    results to ``out_path``, preserving folder structure. Smoothing is NaN-safe:
+    contiguous non-NaN runs are smoothed independently and NaN regions are left
+    untouched.
+
+    Parameters
+    ----------
     in_path : str
-        Input directory path
+        Input directory path containing CSV files.
     out_path : str
-        Output directory path
+        Output directory path for smoothed CSV files.
     sampling_rate : int
-        Sampling rate in Hz
+        Sampling rate in Hz.
     sigma_seconds : float, optional
-        Standard deviation of the Gaussian kernel in seconds (default: 0.05)
+        Standard deviation of the Gaussian kernel in seconds. Default 0.05.
+
+    Returns
+    -------
+    None
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -1634,16 +1640,17 @@ def gaussian_smooth_signals(in_path: str, out_path: str, sampling_rate: int, sig
 
         for column in df.columns:
             if column.lower() != 'time':
-                df[column] = apply_gaussian_smooth_nan_safe(df[column].values, sampling_rate, sigma_seconds)
+                df[column] = _apply_gaussian_smooth_nan_safe(
+                    df[column].values, sampling_rate, sigma_seconds
+                )
 
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_file_path, index=False)
 
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
-    
+
 #
 # =============================================================================
 #
