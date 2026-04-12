@@ -2,6 +2,7 @@ from RespFlow.access_files import map_files
 from scipy.signal import butter, sosfiltfilt, find_peaks
 from scipy.interpolate import PchipInterpolator, CubicSpline
 from scipy.ndimage import binary_closing, gaussian_filter1d
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 import pandas as pd
@@ -851,127 +852,108 @@ def bandpass_filter_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # ANOMALY DETECTION
+#
+#
 # =============================================================================
 #
 
-def detect_anomalies_iqr(signal_series, window_size=60_000):
-    # Calculate rolling Q1 (25th percentile) and Q3 (75th percentile)
+def _detect_anomalies_iqr(
+    signal_series: pd.Series,
+    window_size: int = 60_000,
+) -> pd.Series:
+    """Flag samples outside the rolling IQR (1.5 * IQR) as anomalies."""
     rolling_q1 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.25)
     rolling_q3 = signal_series.rolling(window=window_size, center=True, min_periods=1).quantile(0.75)
-    
-    # Calculate rolling IQR
     rolling_iqr = rolling_q3 - rolling_q1
-    
-    # Define dynamic upper and lower bounds
-    lower_bound = rolling_q1 - (1.5 * rolling_iqr)
-    upper_bound = rolling_q3 + (1.5 * rolling_iqr)
-    
-    # Flag points outside the bounds
+
+    lower_bound = rolling_q1 - 1.5 * rolling_iqr
+    upper_bound = rolling_q3 + 1.5 * rolling_iqr
+
     anomalies = (signal_series < lower_bound) | (signal_series > upper_bound)
-    
-    # Fill NaN values created by the rolling window at the edges
     return anomalies.fillna(False)
 
 
-def detect_anomalies_zscore(signal_series, window_size=60_000, z_threshold=2.0):
-    # Calculate rolling mean and standard deviation
+def _detect_anomalies_zscore(
+    signal_series: pd.Series,
+    window_size: int = 60_000,
+    z_threshold: float = 2.0,
+) -> pd.Series:
+    """Flag samples more than ``z_threshold`` standard deviations from the rolling mean."""
     rolling_mean = signal_series.rolling(window=window_size, center=True, min_periods=1).mean()
     rolling_std = signal_series.rolling(window=window_size, center=True, min_periods=1).std()
     
-    # Calculate the Z-score for each point
-    z_scores = (signal_series - rolling_mean) / rolling_std
+    z_scores = (signal_series - rolling_mean) / rolling_std.replace(0, np.nan)
     
-    # Flag points where the absolute Z-score exceeds the threshold
     anomalies = np.abs(z_scores) > z_threshold
-    
-    # Fill NaN values at the edges
     return anomalies.fillna(False)
 
 
-def detect_anomalies_energy_ratio(signal_series, short_window=8_000, long_window=60_000,
-                                   upper_ratio=3.0, lower_ratio=0.1):
+def _detect_anomalies_energy_ratio(
+    signal_series: pd.Series,
+    short_window: int = 8_000,
+    long_window: int = 60_000,
+    upper_ratio: float = 3.0,
+    lower_ratio: float = 0.1,
+) -> pd.Series:
     """
-    Flags regions where local energy deviates from the longer-term baseline.
+    Flag samples where the short-to-long rolling variance ratio departs from 1.
 
-    Compares short-term rolling variance to long-term rolling variance.
-    ratio >> 1  →  local burst  (motion, cough, artifact)
-    ratio << 1  →  local quiescence  (apnea, signal dropout)
-
-    Parameters
-    ----------
-    signal_series : pd.Series
-    short_window : int
-        Short-term variance window in samples.  Must span at least ~2 breath
-        cycles so that normal sinusoidal oscillation averages out.
-        Default 8000 = 4 s at 2000 Hz (~2 breaths at 0.25 Hz).
-    long_window : int
-        Long-term variance window in samples (default 60000 = 30 s at 2000 Hz).
-    upper_ratio : float
-        Flag where ratio exceeds this (energy burst). Default 3.0.
-    lower_ratio : float
-        Flag where ratio falls below this (energy drop). Default 0.1.
+    A ratio far above 1 indicates a local energy burst (motion, cough, artifact);
+    a ratio far below 1 indicates local quiescence (apnea, signal dropout).
     """
+    long_window = max(long_window, short_window + 1)
     short_var = signal_series.rolling(window=short_window, center=True, min_periods=1).var()
     long_var = signal_series.rolling(window=long_window, center=True, min_periods=1).var()
 
-    # Avoid division by zero — where long_var is ~0 the signal is essentially
-    # flatlined, which is itself anomalous
+    # Where long_var is ~0 the signal is flatlined, which is itself anomalous.
     ratio = short_var / long_var.replace(0, np.nan)
 
     anomalies = (ratio > upper_ratio) | (ratio < lower_ratio)
     return anomalies.fillna(False)
 
 
-def detect_anomalies_ensemble(signal_series, window_size=60_000, min_votes=2):
-    """
-    Combines IQR, Z-Score, and Energy-Ratio methods to find anomalies.
-    Requires at least 'min_votes' methods to flag a point as True.
-    """
-    iqr_flags = detect_anomalies_iqr(signal_series, window_size=window_size)
-    zscore_flags = detect_anomalies_zscore(signal_series, window_size=window_size)
-    energy_flags = detect_anomalies_energy_ratio(signal_series, long_window=window_size)
+def _detect_anomalies_ensemble(
+    signal_series: pd.Series,
+    window_size: int = 60_000,
+    min_votes: int = 2,
+    z_threshold: float = 2.0,
+) -> np.ndarray:
+    """Combine IQR / Z-score / energy-ratio detectors and flag samples with at least ``min_votes``."""
+    iqr_flags = _detect_anomalies_iqr(signal_series, window_size=window_size)
+    zscore_flags = _detect_anomalies_zscore(signal_series, window_size=window_size, z_threshold=z_threshold)
+    energy_flags = _detect_anomalies_energy_ratio(signal_series, long_window=window_size)
 
-    total_votes = iqr_flags.astype(int) + zscore_flags.astype(int) + energy_flags.astype(int)
+    total_votes = iqr_flags.to_numpy(dtype=int) + zscore_flags.to_numpy(dtype=int) + energy_flags.to_numpy(dtype=int)
 
     ensemble_anomalies = total_votes >= min_votes
     return ensemble_anomalies   
 
-def merge_close_anomalies(anomaly_mask, max_gap_samples=6000):
-    """
-    Merges anomaly blocks that are separated by fewer than 'max_gap_samples'.
-    """
-    # Create a structural element of ones (the size of the allowed gap)
-    structure = np.ones(max_gap_samples)
+def _merge_close_anomalies(
+    anomaly_mask: np.ndarray,
+    max_gap_samples: int = 6000,
+) -> np.ndarray:
+    """Merge anomaly runs separated by fewer than ``max_gap_samples`` samples via binary closing."""
+    structure = np.ones(max_gap_samples, dtype=bool)
 
-    # Run the closing operation
-    # It will turn [True, False, False, True] into [True, True, True, True]
+    # Binary closing bridges anomaly runs separated by fewer than max_gap_samples.
     merged_mask = binary_closing(anomaly_mask, structure=structure)
 
     return merged_mask
 
 
-def pad_anomaly_mask(anomaly_mask, pad_samples):
-    """
-    Expands each contiguous anomaly region by a fixed number of samples
-    on each side, clamped to the array bounds.
-
-    Parameters
-    ----------
-    anomaly_mask : array-like of bool
-        Boolean mask where True indicates an anomalous sample.
-    pad_samples : int
-        Number of samples to add on each side of every anomaly block.
-
-    Returns
-    -------
-    padded : np.ndarray of bool
-    """
+def _pad_anomaly_mask(
+    anomaly_mask: np.ndarray,
+    pad_samples: int,
+) -> np.ndarray:
+    """Expand each contiguous anomaly run by ``pad_samples`` on each side, clamped to array bounds."""
     mask = np.asarray(anomaly_mask, dtype=bool)
     padded = mask.copy()
     n = len(mask)
 
-    # Find starts and ends of contiguous True runs
     diff = np.diff(np.concatenate(([False], mask, [False])).astype(int))
     starts = np.where(diff == 1)[0]
     ends = np.where(diff == -1)[0]
@@ -988,12 +970,19 @@ def detect_anomalies(
     sampling_rate: int,
     window_size_seconds: float = 30,
     min_votes: int = 2,
+    z_threshold: float = 2.0,
     merge_gap_seconds: float = 1,
     pad_seconds: float = 2.5,
 ) -> None:
     """
-    Detects anomalies using an ensemble of IQR, Z-Score, and Energy-Ratio
-    methods, and replaces flagged points with NaN.
+    Detect anomalies in all signal columns via an ensemble of detectors.
+
+    Runs an IQR / Z-score / energy-ratio ensemble on every non-time column of
+    each CSV under ``in_path``. Samples flagged by at least ``min_votes``
+    detectors are marked anomalous. Anomaly runs closer than
+    ``merge_gap_seconds`` are merged, each run is padded by ``pad_seconds`` on
+    each side, and the flagged samples in the original column are replaced with
+    NaN. The boolean mask is stored alongside each column as ``<column>_anomaly``.
 
     Parameters
     ----------
@@ -1004,14 +993,21 @@ def detect_anomalies(
     sampling_rate : int
         Sampling rate in Hz.
     window_size_seconds : float, optional
-        Rolling window size in seconds for detection methods (default: 30).
+        Rolling window size in seconds for the detectors. Default 30.
     min_votes : int, optional
-        Minimum number of methods that must flag a point (default: 2).
+        Minimum number of detectors that must flag a sample. Default 2.
+    z_threshold : float, optional
+        Number of standard deviations from the rolling mean to flag as anomalous. Default 2.0.
     merge_gap_seconds : float, optional
-        Maximum gap in seconds between anomaly blocks to merge (default: 0, no merging).
+        Maximum gap in seconds between anomaly runs to merge. Default 1.
+        Set to 0 to disable merging.
     pad_seconds : float, optional
-        Seconds of padding to add on each side of every anomaly block.
-        Default 0 disables padding.
+        Seconds of padding to add on each side of every anomaly run. Default 2.5.
+        Set to 0 to disable padding.
+
+    Returns
+    -------
+    None
     """
     window_samples = seconds_to_samples(window_size_seconds, sampling_rate)
     merge_gap_samples = seconds_to_samples(merge_gap_seconds, sampling_rate)
@@ -1027,24 +1023,23 @@ def detect_anomalies(
 
         for column in df.columns:
             if column.lower() != 'time':
-                mask = detect_anomalies_ensemble(
+                mask = _detect_anomalies_ensemble(
                     df[column],
                     window_size=window_samples,
                     min_votes=min_votes,
+                    z_threshold=z_threshold,
                 )
 
                 if merge_gap_samples > 0:
-                    mask = merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
+                    mask = _merge_close_anomalies(mask, max_gap_samples=merge_gap_samples)
 
                 if pad_samples > 0:
-                    mask = pad_anomaly_mask(mask, pad_samples=pad_samples)
+                    mask = _pad_anomaly_mask(mask, pad_samples=pad_samples)
 
                 df[f'{column}_anomaly'] = mask
                 df.loc[mask, column] = np.nan
 
-        # Preserve folder structure
-        file_path_obj = Path(file_path)
-        relative_path = file_path_obj.relative_to(in_path_obj)
+        relative_path = Path(file_path).relative_to(in_path_obj)
         output_file_path = out_path_obj / relative_path
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
 
