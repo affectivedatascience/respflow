@@ -1145,28 +1145,32 @@ def post_anomaly_interp_signals(
     print(f"Processed {len(mapped_files)} files from {in_path} to {out_path}")
 
 #
+# =============================================================================
+#
+#
 # IMPUTE ANOMALY (CYCLE-SYNTHESIS)
+#
+#
 # =============================================================================
 #
 
-
-def _resample_to_length(y: np.ndarray, M: int) -> np.ndarray:
-    """Linear resample y (1D) to exactly M points."""
+def _resample_to_length(y: np.ndarray, n_points: int) -> np.ndarray:
+    """Linear resample y (1D) to exactly n_points points."""
     y = np.asarray(y, dtype=float)
     if y.size == 0:
-        return np.full(M, np.nan)
+        return np.full(n_points, np.nan)
     if y.size == 1:
-        return np.full(M, y[0])
-    xi = np.linspace(0.0, 1.0, num=y.size)
-    xo = np.linspace(0.0, 1.0, num=M)
-    return np.interp(xo, xi, y)
+        return np.full(n_points, y[0])
+    x_in = np.linspace(0.0, 1.0, num=y.size)
+    x_out = np.linspace(0.0, 1.0, num=n_points)
+    return np.interp(x_out, x_in, y)
 
 
-def _raised_cosine_weights(B: int) -> np.ndarray:
-    """0..1 raised-cosine ramp of length B."""
-    if B <= 0:
+def _raised_cosine_weights(n_samples: int) -> np.ndarray:
+    """0..1 raised-cosine ramp of length n_samples."""
+    if n_samples <= 0:
         return np.array([], dtype=float)
-    t = np.linspace(0.0, 1.0, B)
+    t = np.linspace(0.0, 1.0, n_samples)
     return 0.5 - 0.5 * np.cos(np.pi * t)
 
 
@@ -1183,24 +1187,43 @@ def _pick_finite_average(a: float, b: float) -> float | None:
 
 
 def _extract_clean_context(
-    x: np.ndarray, g0: int, g1: int, fs: float, context_s: float
+    x: np.ndarray,
+    gap_start: int,
+    gap_end: int,
+    sampling_rate: float,
+    context_s: float,
 ) -> tuple[tuple[int, int, np.ndarray], tuple[int, int, np.ndarray]]:
-    """Extract clean signal context on both sides of a gap [g0, g1)."""
-    N = len(x)
-    L = seconds_to_samples(context_s, fs)
-    l0, l1 = max(0, g0 - L), g0
-    r0, r1 = g1, min(N, g1 + L)
-    xL = x[l0:l1]
-    xR = x[r0:r1]
-    return (l0, l1, xL), (r0, r1, xR)
+    """
+    Extract clean signal context on both sides of a gap [gap_start, gap_end).
+
+    Returns ``((left_start, left_end, left_signal),
+    (right_start, right_end, right_signal))`` where each slice is up to
+    ``context_s`` seconds of the observed signal adjacent to the gap.
+    """
+    n_samples = len(x)
+    context_samples = seconds_to_samples(context_s, sampling_rate)
+    left_start, left_end = max(0, gap_start - context_samples), gap_start
+    right_start, right_end = gap_end, min(n_samples, gap_end + context_samples)
+    left_signal = x[left_start:left_end]
+    right_signal = x[right_start:right_end]
+    return (left_start, left_end, left_signal), (right_start, right_end, right_signal)
 
 
-def _detect_troughs(x_seg: np.ndarray, fs: float,
-                    max_bpm: float = 60.0):
-    """Detect troughs in a segment using find_peaks on -x."""
+def _detect_troughs(
+    x_seg: np.ndarray,
+    sampling_rate: float,
+    max_bpm: float = 60.0,
+) -> np.ndarray:
+    """
+    Detect troughs via ``find_peaks`` on the negated segment.
+
+    NaN values are linearly interpolated before peak detection so that
+    small internal gaps don't break cycle estimation.  Prominence is
+    set to 0.25 * MAD to reject noise bumps.
+    """
     x_seg = np.asarray(x_seg, dtype=float)
     valid = np.isfinite(x_seg)
-    if valid.sum() < 10:
+    if valid.sum() < 10:  # minimum samples for find_peaks to return reliable results
         return np.array([], dtype=int)
 
     y = x_seg.copy()
@@ -1211,57 +1234,80 @@ def _detect_troughs(x_seg: np.ndarray, fs: float,
         y = s.to_numpy()
 
     min_period_s = 60.0 / max_bpm
-    min_dist = max(1, seconds_to_samples(min_period_s, fs))
+    min_dist = max(1, seconds_to_samples(min_period_s, sampling_rate))
 
     mad = _robust_mad(y)
     if not np.isfinite(mad) or mad == 0:
         mad = np.nanstd(y)
     if not np.isfinite(mad) or mad == 0:
-        mad = 1.0
+        mad = 1.0  # last-resort fallback so prominence is nonzero
 
+    # 0.25 * MAD rejects small noise bumps while passing genuine breath troughs
     troughs, _ = find_peaks(-y, distance=min_dist, prominence=0.25 * mad)
     return troughs.astype(int)
 
 
-def _estimate_period_amp_from_cycles(x_ctx: np.ndarray, troughs: np.ndarray, fs: float):
-    """Estimate period (seconds) and amplitude (peak-to-trough) from cycles."""
-    if troughs.size < 3:
+def _estimate_period_amp_from_cycles(
+    context_signal: np.ndarray,
+    troughs: np.ndarray,
+    sampling_rate: float,
+) -> tuple[float, float, int]:
+    """
+    Estimate breathing period and amplitude from trough-delimited cycles.
+
+    Returns ``(period_s, amplitude, n_cycles)`` where *period_s* is the
+    median inter-trough interval in seconds, *amplitude* is the median
+    peak-to-trough range, and *n_cycles* is how many usable cycles were found.
+    """
+    if troughs.size < 3:  # need at least 2 inter-trough intervals for a stable median
         return np.nan, np.nan, 0
 
-    dt = np.diff(troughs) / fs
-    T = float(np.median(dt))
+    cycle_durations_s = np.diff(troughs) / sampling_rate
+    period_s = float(np.median(cycle_durations_s))
 
     amps = []
     for i in range(troughs.size - 1):
-        seg = x_ctx[troughs[i]:troughs[i + 1]]
+        seg = context_signal[troughs[i]:troughs[i + 1]]
         seg = seg[np.isfinite(seg)]
-        if seg.size < 3:
+        if seg.size < 3:  # need at least a min, max, and one interior sample for a valid range
             continue
         amps.append(np.nanmax(seg) - np.nanmin(seg))
 
-    A = float(np.median(amps)) if len(amps) else np.nan
-    return T, A, len(amps)
+    amplitude = float(np.median(amps)) if len(amps) else np.nan
+    return period_s, amplitude, len(amps)
 
 
-def _build_cycle_template(x_ctx: np.ndarray, troughs: np.ndarray,
-                          M: int = 200, n_cycles_use: int = 5):
-    """Build a robust median template from up to n_cycles_use clean cycles."""
-    if troughs.size < 3:
+def _build_cycle_template(
+    context_signal: np.ndarray,
+    troughs: np.ndarray,
+    n_points: int = 200,
+    n_cycles_use: int = 5,
+) -> np.ndarray | None:
+    """
+    Build a robust median template from up to *n_cycles_use* clean cycles.
+
+    Each trough-to-trough cycle is median-centred, resampled to *n_points*,
+    and stacked; the element-wise median gives the template.  Returns
+    ``None`` if fewer than one usable cycle is available.
+    """
+    if troughs.size < 3:  # need at least 2 complete trough-to-trough cycles
         return None
 
     cycles = []
-    start_i = max(0, (troughs.size - 1) - n_cycles_use)
-    for i in range(start_i, troughs.size - 1):
-        a = troughs[i]
-        b = troughs[i + 1]
-        seg = x_ctx[a:b]
-        if np.isfinite(seg).sum() < max(5, (b - a) // 2):
+    first_cycle_idx = max(0, (troughs.size - 1) - n_cycles_use)
+    for i in range(first_cycle_idx, troughs.size - 1):
+        cycle_start = troughs[i]
+        cycle_end = troughs[i + 1]
+        seg = context_signal[cycle_start:cycle_end]
+        # Require at least 5 finite samples or half the cycle, whichever is larger,
+        # so heavily NaN-corrupted cycles don't distort the template median.
+        if np.isfinite(seg).sum() < max(5, (cycle_end - cycle_start) // 2):
             continue
-        seg2 = seg.astype(float)
-        seg2 = seg2 - float(np.nanmedian(seg2))
-        seg_rs = _resample_to_length(seg2, M)
-        if np.isfinite(seg_rs).all():
-            cycles.append(seg_rs)
+        centered = seg.astype(float)
+        centered = centered - float(np.nanmedian(centered))
+        resampled = _resample_to_length(centered, n_points)
+        if np.isfinite(resampled).all():
+            cycles.append(resampled)
 
     if not cycles:
         return None
@@ -1269,67 +1315,97 @@ def _build_cycle_template(x_ctx: np.ndarray, troughs: np.ndarray,
     return np.median(np.vstack(cycles), axis=0)
 
 
-def _synthesize_from_template(template: np.ndarray, fs: float,
-                              g_len: int, T: float,
-                              phase0_frac: float, amp: float):
-    """Tile a template over a gap of length g_len samples."""
-    M = template.size
-    if not np.isfinite(T) or T <= 0:
+def _synthesize_from_template(
+    template: np.ndarray,
+    sampling_rate: float,
+    gap_length: int,
+    period_s: float,
+    phase0_frac: float,
+    amplitude: float,
+) -> np.ndarray | None:
+    """
+    Tile a cycle template over a gap using phase-lookup interpolation.
+
+    Each output sample's phase within the breathing cycle is computed from
+    its index, the period, and the starting phase fraction.  The template
+    is amplitude-scaled to match the observed context, and ``np.interp``
+    maps the continuous phase to the discrete template points.
+    """
+    n_points = template.size
+    if not np.isfinite(period_s) or period_s <= 0:
         return None
 
-    tmin, tmax = float(np.min(template)), float(np.max(template))
-    tA = tmax - tmin
-    if tA <= 0 or not np.isfinite(tA):
-        tA = 1.0
+    template_min = float(np.min(template))
+    template_max = float(np.max(template))
+    template_range = template_max - template_min
+    if template_range <= 0 or not np.isfinite(template_range):
+        template_range = 1.0  # fallback so the amplitude scale factor doesn't blow up
 
-    scale = amp / tA if np.isfinite(amp) and amp > 0 else 1.0
-    templ_scaled = template * scale
+    scale = amplitude / template_range if np.isfinite(amplitude) and amplitude > 0 else 1.0
+    scaled_template = template * scale
 
-    samples_per_cycle = T * fs
+    samples_per_cycle = period_s * sampling_rate
     if samples_per_cycle <= 1:
         return None
 
-    n = np.arange(g_len)
-    frac = (phase0_frac + (n / samples_per_cycle)) % 1.0
-    idx = frac * (M - 1)
-    return np.interp(idx, np.arange(M), templ_scaled)
+    sample_indices = np.arange(gap_length)
+    phase_position = (phase0_frac + (sample_indices / samples_per_cycle)) % 1.0  # wrap to [0, 1) for periodic lookup
+    template_indices = phase_position * (n_points - 1)  # map phase [0, 1) to template indices [0, n_points-1]
+    return np.interp(template_indices, np.arange(n_points), scaled_template)
 
 
-def _edge_crossfade(x: np.ndarray, y_gap: np.ndarray, g0: int, g1: int,
-                    fs: float, blend_s: float):
-    """Cross-fade y_gap to observed data at edges."""
-    B = seconds_to_samples(blend_s, fs)
-    if B <= 0:
+def _edge_crossfade(
+    signal: np.ndarray,
+    y_gap: np.ndarray,
+    gap_start: int,
+    gap_end: int,
+    sampling_rate: float,
+    blend_s: float,
+) -> np.ndarray:
+    """
+    Cross-fade the synthesised gap fill to observed data at both edges.
+
+    If fewer than half the blend samples are finite on a given side the
+    blend window shrinks to the number of available finite samples, so a
+    partial crossfade is still applied rather than skipping that edge.
+    """
+    blend_samples = seconds_to_samples(blend_s, sampling_rate)
+    if blend_samples <= 0:
         return y_gap
 
     # left edge
-    left_start = max(0, g0 - B)
-    xL = x[left_start:g0]
-    B_left = B if np.isfinite(xL).sum() >= max(3, B // 2) else int(np.isfinite(xL).sum())
+    left_start = max(0, gap_start - blend_samples)
+    left_observed = signal[left_start:gap_start]
+    n_finite_left = np.isfinite(left_observed).sum()
+    # Use full blend window if at least half the samples are finite; shrink to
+    # however many are finite otherwise. 3 is the minimum for a meaningful fade.
+    left_blend = blend_samples if n_finite_left >= max(3, blend_samples // 2) else int(n_finite_left)
 
     # right edge
-    right_end = min(len(x), g1 + B)
-    xR = x[g1:right_end]
-    B_right = B if np.isfinite(xR).sum() >= max(3, B // 2) else int(np.isfinite(xR).sum())
+    right_end = min(len(signal), gap_end + blend_samples)
+    right_observed = signal[gap_end:right_end]
+    n_finite_right = np.isfinite(right_observed).sum()
+    right_blend = blend_samples if n_finite_right >= max(3, blend_samples // 2) else int(n_finite_right)
 
-    if B_left > 2 and y_gap.size >= B_left:
-        w = _raised_cosine_weights(B_left)
-        xL_use = pd.Series(x[g0 - B_left:g0]).interpolate(limit_direction="both").to_numpy()
-        y_gap[:B_left] = (1 - w) * xL_use + w * y_gap[:B_left]
+    if left_blend > 2 and y_gap.size >= left_blend:  # skip if fewer than 3 samples (minimum for a raised-cosine fade)
+        weights = _raised_cosine_weights(left_blend)
+        left_interp = pd.Series(signal[gap_start - left_blend:gap_start]).interpolate(limit_direction="both").to_numpy()
+        y_gap[:left_blend] = (1 - weights) * left_interp + weights * y_gap[:left_blend]
 
-    if B_right > 2 and y_gap.size >= B_right:
-        w = _raised_cosine_weights(B_right)
-        xR_use = pd.Series(x[g1:g1 + B_right]).interpolate(limit_direction="both").to_numpy()
-        y_gap[-B_right:] = (1 - w[::-1]) * xR_use + w[::-1] * y_gap[-B_right:]
+    if right_blend > 2 and y_gap.size >= right_blend:  # skip if fewer than 3 samples (minimum for a raised-cosine fade)
+        weights = _raised_cosine_weights(right_blend)
+        weights_rev = weights[::-1]
+        right_interp = pd.Series(signal[gap_end:gap_end + right_blend]).interpolate(limit_direction="both").to_numpy()
+        y_gap[-right_blend:] = (1 - weights_rev) * right_interp + weights_rev * y_gap[-right_blend:]
 
     return y_gap
 
 
 # ── Main orchestrator ────────────────────────────────────────────────────────
 
-def cycle_synthesis_impute(
+def _cycle_synthesis_impute(
     x: np.ndarray,
-    fs: float,
+    sampling_rate: float,
     anomaly_mask: np.ndarray | None = None,
     context_s: float = 20.0,
     blend_s: float = 0.5,
@@ -1346,7 +1422,7 @@ def cycle_synthesis_impute(
     ----------
     x : np.ndarray
         1D signal with NaN gaps.
-    fs : float
+    sampling_rate : float
         Sampling rate in Hz.
     anomaly_mask : np.ndarray or None
         Boolean mask where True = anomaly-flagged sample. If provided,
@@ -1377,70 +1453,81 @@ def cycle_synthesis_impute(
     # Only process gaps that overlap the anomaly mask
     if anomaly_mask is not None:
         anomaly_mask = np.asarray(anomaly_mask, dtype=bool)
-        gaps = [(g0, g1, G) for g0, g1, G in gaps
-                if np.any(anomaly_mask[g0:g1])]
+        gaps = [(gap_start, gap_end, gap_length)
+                for gap_start, gap_end, gap_length in gaps
+                if np.any(anomaly_mask[gap_start:gap_end])]
 
-    for g0, g1, G in gaps:
-        if G <= 0:
+    for gap_start, gap_end, gap_length in gaps:
+        if gap_length <= 0:
             continue
 
-        (l0, l1, xL), (r0, r1, xR) = _extract_clean_context(x_filled, g0, g1, fs, context_s)
+        (left_start, left_end, left_signal), (right_start, right_end, right_signal) = (
+            _extract_clean_context(x_filled, gap_start, gap_end, sampling_rate, context_s)
+        )
 
         # Need at least 3 s of clean data per side to estimate breathing cycles
-        if np.isfinite(xL).sum() < seconds_to_samples(3, fs) or np.isfinite(xR).sum() < seconds_to_samples(3, fs):
+        if (np.isfinite(left_signal).sum() < seconds_to_samples(3, sampling_rate)
+                or np.isfinite(right_signal).sum() < seconds_to_samples(3, sampling_rate)):
             continue
 
         # Detect troughs and estimate period/amplitude
-        tL = _detect_troughs(xL, fs)
-        tR = _detect_troughs(xR, fs)
+        left_troughs = _detect_troughs(left_signal, sampling_rate)
+        right_troughs = _detect_troughs(right_signal, sampling_rate)
 
-        TL, AL, nCL = _estimate_period_amp_from_cycles(xL, tL, fs)
-        TR, AR, nCR = _estimate_period_amp_from_cycles(xR, tR, fs)
+        left_period, left_amplitude, n_cycles_left = _estimate_period_amp_from_cycles(
+            left_signal, left_troughs, sampling_rate)
+        right_period, right_amplitude, n_cycles_right = _estimate_period_amp_from_cycles(
+            right_signal, right_troughs, sampling_rate)
 
-        if nCL < min_cycles_each_side and nCR < min_cycles_each_side:
+        if n_cycles_left < min_cycles_each_side and n_cycles_right < min_cycles_each_side:
             continue
 
         # Select period
-        T_used = _pick_finite_average(TL, TR)
-        if T_used is None or T_used <= 0:
+        period_s = _pick_finite_average(left_period, right_period)
+        if period_s is None or period_s <= 0:
             continue
 
         # Gate on gap length
-        n_cycles_gap = (G / fs) / T_used
+        n_cycles_gap = (gap_length / sampling_rate) / period_s
         if n_cycles_gap > max_gap_cycles:
             continue
 
         # Select amplitude
-        A_used = _pick_finite_average(AL, AR)
-        if A_used is None:
-            A_used = 2.0 * _robust_mad(np.r_[xL, xR])
-            if not np.isfinite(A_used) or A_used <= 0:
-                A_used = 1.0
+        amplitude = _pick_finite_average(left_amplitude, right_amplitude)
+        if amplitude is None:
+            amplitude = 2.0 * _robust_mad(np.r_[left_signal, right_signal])
+            if not np.isfinite(amplitude) or amplitude <= 0:
+                amplitude = 1.0
 
         # Phase alignment from last trough in left context
         phase0_frac = 0.0
-        if tL.size >= 2:
-            last_trough_abs = l0 + tL[-1]
-            dt_samples = max(0, g0 - last_trough_abs)
-            phase0_frac = (dt_samples / (T_used * fs)) % 1.0
+        if left_troughs.size >= 2:
+            last_trough_abs = left_start + left_troughs[-1]
+            dt_samples = max(0, gap_start - last_trough_abs)
+            phase0_frac = (dt_samples / (period_s * sampling_rate)) % 1.0
 
         # Build template (prefer left context, fallback to right)
-        template = _build_cycle_template(xL, tL, M=template_points, n_cycles_use=template_cycles_use)
+        template = _build_cycle_template(
+            left_signal, left_troughs,
+            n_points=template_points, n_cycles_use=template_cycles_use)
         if template is None:
-            template = _build_cycle_template(xR, tR, M=template_points, n_cycles_use=template_cycles_use)
+            template = _build_cycle_template(
+                right_signal, right_troughs,
+                n_points=template_points, n_cycles_use=template_cycles_use)
 
         if template is None or not np.isfinite(template).all():
             continue
 
         # Synthesize and crossfade
-        y_gap = _synthesize_from_template(template, fs, G, T_used, phase0_frac, A_used)
+        y_gap = _synthesize_from_template(
+            template, sampling_rate, gap_length, period_s, phase0_frac, amplitude)
         if y_gap is None or not np.isfinite(y_gap).all():
             continue
 
-        y_gap = _edge_crossfade(x_filled, y_gap, g0, g1, fs, blend_s)
+        y_gap = _edge_crossfade(x_filled, y_gap, gap_start, gap_end, sampling_rate, blend_s)
 
-        x_filled[g0:g1] = y_gap
-        mask_imputed[g0:g1] = True
+        x_filled[gap_start:gap_end] = y_gap
+        mask_imputed[gap_start:gap_end] = True
 
     return x_filled, mask_imputed
 
@@ -1487,6 +1574,10 @@ def impute_anomaly_signals(
     template_cycles_use : int, optional
         Clean cycles to use for the median template (default 5).
 
+    Returns
+    -------
+    None
+
     Notes
     -----
     A gap is left as NaN (skipped) when any of the following apply:
@@ -1503,6 +1594,7 @@ def impute_anomaly_signals(
     - Template construction fails (too few finite samples in the context
       cycles to build a reliable median shape).
     - The synthesised fill contains non-finite values.
+
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -1525,9 +1617,9 @@ def impute_anomaly_signals(
                 else None
             )
 
-            filled, _ = cycle_synthesis_impute(
+            filled, _ = _cycle_synthesis_impute(
                 df[column].values,
-                fs=sampling_rate,
+                sampling_rate=sampling_rate,
                 anomaly_mask=anomaly_mask,
                 context_s=context_s,
                 blend_s=blend_s,
