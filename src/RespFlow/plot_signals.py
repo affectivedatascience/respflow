@@ -6,7 +6,45 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 
-def plot_dashboard(mapped_files : dict[str, str], column_name : str, max_points=10000) -> None:
+def plot_dashboard(
+    path_names: dict[str, str],
+    column_name: str,
+    max_points: int = 10000,
+) -> None:
+    """
+    Launch an interactive Dash dashboard to compare pipeline stages.
+
+    Discovers all CSV files under the root directory derived from
+    ``path_names`` and displays them in a browser with a file selector
+    and stage checklist.
+
+    Parameters
+    ----------
+    path_names : dict[str, str]
+        Path dictionary as returned by ``make_paths``
+    column_name : str
+        Column name to plot (e.g. ``'Respiration'``)
+    max_points : int, optional
+        Maximum points per trace before downsampling (default 10 000)
+
+    Returns
+    -------
+    None
+    """
+    # Filter to signal stages that have data
+    path_names = path_names.copy()
+    path_names.pop('feature', None)
+    for name in list(path_names.keys()):
+        if not os.path.isdir(path_names[name]) or not os.listdir(path_names[name]):
+            path_names.pop(name)
+
+    # Map files from each stage directory
+    mapped_files = {}
+    for stage_path in path_names.values():
+        stage_files = map_files(stage_path)
+        folder = os.path.basename(stage_path)
+        for rel, abs_path in stage_files.items():
+            mapped_files[os.path.join(folder, rel)] = abs_path
 
     # Extract unique base filenames from the mapped files
     # Assumes files are structured as "stage/dir1/dir2/dir3/.../filename.csv"
