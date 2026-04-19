@@ -12,7 +12,7 @@ _RespFlow_ is meant to be a sibling package to [_EMGFlow_](https://github.com/Wi
 
 ## Statement Of Need
 
-The recent explosion of interest in AI and wearable technology has led to a wealth of physiological data of all kinds. Between consumer smart tech and low-cost research equipment, a gold rush has emerged for a variety of research disciplines. Within respiration alone, areas such as exercise physiology, clinical monitoring, and consumer wearables greatly stand to benefit. Many of the established open-source packages available to process this information, however, lack the ability to handle and impute artefacts common in low-cost equipment. In the face of this we present: **RespFlow**
+The recent explosion of interest in AI and wearable technology has led to a wealth of physiological data of all kinds. Between consumer smart tech and low-cost research equipment, a gold rush has emerged for a variety of research disciplines. Within respiration alone, areas such as exercise physiology, clinical monitoring, and consumer wearables greatly stand to benefit. Many of the established open-source packages available to process this information, however, lack the ability to handle and impute artefacts common in low-cost equipment. In the face of this we present: **RespFlow**.
 
 Although many of these packages provide signal preprocessing and feature extraction, our Python package is the first of its kind to provide artefact handling and cycle-aware signal imputation. This will democratize access to researchers with tighter budgets, while also providing cleaner signals and features for downstream machine learning pipelines.
 
