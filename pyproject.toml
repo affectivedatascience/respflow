@@ -9,6 +9,15 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 dynamic = ["version", "description"]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0.0",
+    "pandas>=2.1.0",
+    "scipy>=1.14.0",
+    "plotly",
+    "dash",
+    "dash-ag-grid",
+]
 
 [project.urls]
-Home = "https://github.com/garciadavid2000/RespFlow-Python-Package"
+Home = "https://github.com/affectivedatascience/respflow"

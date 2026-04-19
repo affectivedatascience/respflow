@@ -88,6 +88,16 @@ rf.plot_dashboard(path_names, 'Respiration')
 
 The package has not yet been deployed to PyPI, but feel free to git clone the repo and install it locally!
 
+1. Clone the repo
+
+2. cd into the repo you just cloned with
+
+```bash
+cd respflow
+```
+
+3. Install the package
+
 ```bash 
 pip install -e .
 ```
