@@ -894,8 +894,8 @@ def _detect_anomalies_zscore(
 
 def _detect_anomalies_energy_ratio(
     signal_series: pd.Series,
-    short_window: int = 8_000,
     long_window: int = 60_000,
+    short_long_ratio: float = 0.125,
     upper_ratio: float = 3.0,
     lower_ratio: float = 0.1,
 ) -> pd.Series:
@@ -905,6 +905,7 @@ def _detect_anomalies_energy_ratio(
     A ratio far above 1 indicates a local energy burst (motion, cough, artifact);
     a ratio far below 1 indicates local quiescence (apnea, signal dropout).
     """
+    short_window = max(1, int(long_window * short_long_ratio))
     long_window = max(long_window, short_window + 1)
     short_var = signal_series.rolling(window=short_window, center=True, min_periods=1).var()
     long_var = signal_series.rolling(window=long_window, center=True, min_periods=1).var()
@@ -921,11 +922,12 @@ def _detect_anomalies_ensemble(
     window_size: int = 60_000,
     min_votes: int = 2,
     z_threshold: float = 2.0,
+    short_long_ratio: float = 0.125,
 ) -> np.ndarray:
     """Combine IQR / Z-score / energy-ratio detectors and flag samples with at least ``min_votes``."""
     iqr_flags = _detect_anomalies_iqr(signal_series, window_size=window_size)
     zscore_flags = _detect_anomalies_zscore(signal_series, window_size=window_size, z_threshold=z_threshold)
-    energy_flags = _detect_anomalies_energy_ratio(signal_series, long_window=window_size)
+    energy_flags = _detect_anomalies_energy_ratio(signal_series, long_window=window_size, short_long_ratio=short_long_ratio)
 
     total_votes = iqr_flags.to_numpy(dtype=int) + zscore_flags.to_numpy(dtype=int) + energy_flags.to_numpy(dtype=int)
 
@@ -971,6 +973,7 @@ def detect_anomalies(
     window_size_seconds: float = 30,
     min_votes: int = 2,
     z_threshold: float = 2.0,
+    short_long_ratio: float = 0.125,
     merge_gap_seconds: float = 1,
     pad_seconds: float = 2.5,
 ) -> None:
@@ -998,6 +1001,10 @@ def detect_anomalies(
         Minimum number of detectors that must flag a sample. Default 2.
     z_threshold : float, optional
         Number of standard deviations from the rolling mean to flag as anomalous. Default 2.0.
+    short_long_ratio : float, optional
+        Length of the energy-ratio detector's short window expressed as a fraction
+        of the long (rolling) window. Default ``0.125`` (one eighth). Smaller
+        values make the detector more sensitive to brief bursts..
     merge_gap_seconds : float, optional
         Maximum gap in seconds between anomaly runs to merge. Default 1.
         Set to 0 to disable merging.
@@ -1028,6 +1035,7 @@ def detect_anomalies(
                     window_size=window_samples,
                     min_votes=min_votes,
                     z_threshold=z_threshold,
+                    short_long_ratio=short_long_ratio,
                 )
 
                 if merge_gap_samples > 0:
