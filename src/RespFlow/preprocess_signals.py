@@ -1417,7 +1417,7 @@ def _cycle_synthesis_impute(
     anomaly_mask: np.ndarray | None = None,
     context_s: float = 20.0,
     blend_s: float = 0.5,
-    min_cycles_each_side: int = 2,
+    min_cycles_either_side: int = 2,
     max_gap_cycles: int = 10,
     template_points: int = 200,
     template_cycles_use: int = 5,
@@ -1439,8 +1439,9 @@ def _cycle_synthesis_impute(
         Seconds of clean context on each side of a gap.
     blend_s : float
         Seconds for raised-cosine cross-fade at gap edges.
-    min_cycles_each_side : int
-        Minimum clean cycles required on each side.
+    min_cycles_either_side : int
+        Minimum clean cycles that must be detectable on at least one side
+        of the gap.
     max_gap_cycles : int
         Maximum gap length in breathing cycles to attempt.
     template_points : int
@@ -1487,7 +1488,7 @@ def _cycle_synthesis_impute(
         right_period, right_amplitude, n_cycles_right = _estimate_period_amp_from_cycles(
             right_signal, right_troughs, sampling_rate)
 
-        if n_cycles_left < min_cycles_each_side and n_cycles_right < min_cycles_each_side:
+        if n_cycles_left < min_cycles_either_side and n_cycles_right < min_cycles_either_side:
             continue
 
         # Select period
@@ -1546,7 +1547,7 @@ def impute_anomaly_signals(
     sampling_rate: int,
     context_s: float = 20.0,
     blend_s: float = 0.5,
-    min_cycles_each_side: int = 2,
+    min_cycles_either_side: int = 2,
     max_gap_cycles: int = 10,
     template_points: int = 200,
     template_cycles_use: int = 5,
@@ -1573,8 +1574,9 @@ def impute_anomaly_signals(
         Seconds of clean context on each side of a gap (default 20).
     blend_s : float, optional
         Seconds for raised-cosine cross-fade at gap edges (default 0.5).
-    min_cycles_each_side : int, optional
-        Minimum clean cycles required on each side (default 2).
+    min_cycles_either_side : int, optional
+        Minimum clean cycles that must be detectable on at least one side
+        of the gap (default 2).
     max_gap_cycles : int, optional
         Maximum gap length in breathing cycles to attempt (default 10).
     template_points : int, optional
@@ -1592,10 +1594,10 @@ def impute_anomaly_signals(
 
     - The gap does not overlap the ``{column}_anomaly`` mask (i.e. it is
       not an anomaly NaN).
-    - Fewer than 3 seconds of finite data exist in the context window on
-      either side (not enough signal to estimate breathing parameters).
-    - Fewer than ``min_cycles_each_side`` complete breathing cycles are
-      detectable on both sides simultaneously.
+    - Either side of the gap has fewer than 3 seconds of finite data in
+      its context window (not enough signal to estimate breathing parameters).
+    - Both sides of the gap have fewer than ``min_cycles_either_side``
+      detectable breathing cycles.
     - Period estimation fails (no finite period can be derived from either
       side's trough spacing).
     - The gap is longer than ``max_gap_cycles`` breathing cycles.
@@ -1631,7 +1633,7 @@ def impute_anomaly_signals(
                 anomaly_mask=anomaly_mask,
                 context_s=context_s,
                 blend_s=blend_s,
-                min_cycles_each_side=min_cycles_each_side,
+                min_cycles_either_side=min_cycles_either_side,
                 max_gap_cycles=max_gap_cycles,
                 template_points=template_points,
                 template_cycles_use=template_cycles_use,
