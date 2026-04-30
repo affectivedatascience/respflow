@@ -297,6 +297,57 @@ def _apply_hard_fault_to_df(
     return out
 
 
+def _select_data_columns(
+    df: pd.DataFrame,
+    columns: list[str] | None,
+    file_path: str | Path,
+) -> pd.DataFrame:
+    """
+    Filter ``df`` to the time column, the user-selected data columns, and any
+    matching ``{column}_anomaly`` mask columns that exist.
+
+    Returns ``df`` unchanged if ``columns`` is ``None``. Otherwise validates
+    the request and returns a sliced view of ``df``.
+    """
+    if columns is None:
+        return df
+
+    if len(columns) == 0:
+        raise ValueError(
+            f"`columns` was an empty list for {file_path}. "
+            f"Pass None to process all data columns, or provide at least one column name."
+        )
+
+    bad_suffix = [c for c in columns if c.endswith('_anomaly')]
+    if bad_suffix:
+        raise ValueError(
+            f"Columns {bad_suffix} end in '_anomaly'; pass data column names only — "
+            f"matching anomaly mask columns are kept automatically."
+        )
+
+    columns = list(dict.fromkeys(columns))
+
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Columns {missing} not found in {file_path}. "
+            f"Available: {list(df.columns)}"
+        )
+
+    time_col = next((c for c in df.columns if c.lower() == 'time'), None)
+
+    keep: list[str] = []
+    if time_col is not None:
+        keep.append(time_col)
+    keep.extend(columns)
+    for c in columns:
+        anomaly_col = f'{c}_anomaly'
+        if anomaly_col in df.columns and anomaly_col not in keep:
+            keep.append(anomaly_col)
+
+    return df[keep]
+
+
 def hard_fault_signals(
     in_path: str,
     out_path: str,
@@ -329,22 +380,7 @@ def hard_fault_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
-
-        # Find the time column (case-insensitive)
-        time_col = next((c for c in df.columns if c.lower() == 'time'), None)
-
-        if columns is not None:
-            # Validate requested columns exist
-            missing = [c for c in columns if c not in df.columns]
-            if missing:
-                raise ValueError(
-                    f"Columns {missing} not found in {file_path}. "
-                    f"Available: {list(df.columns)}"
-                )
-
-            # Filter to time + requested columns
-            keep = ([time_col] if time_col else []) + columns
-            df = df[keep]
+        df = _select_data_columns(df, columns, file_path)
 
         df2 = _apply_hard_fault_to_df(df, sampling_rate, config=config)
 
@@ -495,6 +531,7 @@ def micro_interp_signals(
     interp_method: str = "pchip",
     percentage_fill: float = 0.3,
     breath_rate_hz: float = 0.25,
+    columns: list[str] | None = None,
 ) -> None:
     """
     Interpolate small NaN gaps in all signal columns across all CSV files.
@@ -517,6 +554,9 @@ def micro_interp_signals(
     breath_rate_hz : float, optional
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
         This is approx adult resting breathing rate.
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column)
+        will be kept in the output. Defaults to all non-time columns.
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -525,6 +565,7 @@ def micro_interp_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+        df = _select_data_columns(df, columns, file_path)
 
         for column in df.columns:
             if column.lower() != 'time':
@@ -601,6 +642,7 @@ def detrend_signals(
     out_path: str,
     sampling_rate: int,
     window_size_seconds: int = 60,
+    columns: list[str] | None = None,
 ) -> None:
     """
     Apply rolling-median detrending to all signal columns in all CSV files.
@@ -619,6 +661,9 @@ def detrend_signals(
     window_size_seconds : int, optional
         Window size for the rolling median in seconds. Default 60.
         If a signal is shorter than this window, a global median is used instead.
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column)
+        will be kept in the output. Defaults to all non-time columns.
     """
     mapped_files = map_files(in_path, file_ext='csv')
 
@@ -627,6 +672,7 @@ def detrend_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+        df = _select_data_columns(df, columns, file_path)
 
         for column in df.columns:
             if column.lower() != 'time':
@@ -783,6 +829,7 @@ def bandpass_filter_signals(
     sampling_rate: int,
     passband: str | tuple = 'default',
     order: int = 2,
+    columns: list[str] | None = None,
 ) -> None:
     """
     Apply a Butterworth bandpass filter to all signal columns in all CSV files.
@@ -807,6 +854,9 @@ def bandpass_filter_signals(
         Default ``'default'``.
     order : int, optional
         Butterworth filter order. Default 2.
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column)
+        will be kept in the output. Defaults to all non-time columns.
 
     Returns
     -------
@@ -836,6 +886,7 @@ def bandpass_filter_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+        df = _select_data_columns(df, columns, file_path)
 
         for column in df.columns:
             if column.lower() != 'time':
@@ -976,6 +1027,7 @@ def detect_anomalies(
     short_long_ratio: float = 0.125,
     merge_gap_seconds: float = 1,
     pad_seconds: float = 2.5,
+    columns: list[str] | None = None,
 ) -> None:
     """
     Detect anomalies in all signal columns via an ensemble of detectors.
@@ -1011,6 +1063,10 @@ def detect_anomalies(
     pad_seconds : float, optional
         Seconds of padding to add on each side of every anomaly run. Default 2.5.
         Set to 0 to disable padding.
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column and
+        any matching ``{column}_anomaly`` masks) will be kept in the output.
+        Defaults to all non-time columns.
 
     Returns
     -------
@@ -1027,6 +1083,7 @@ def detect_anomalies(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+        df = _select_data_columns(df, columns, file_path)
 
         for column in df.columns:
             if column.lower() != 'time':
@@ -1072,6 +1129,7 @@ def post_anomaly_interp_signals(
     interp_method: str = "pchip",
     percentage_fill: float = 0.5,
     breath_rate_hz: float = 0.25,
+    columns: list[str] | None = None,
 ) -> None:
     """
     Fill medium-sized NaN gaps introduced by anomaly detection.
@@ -1079,7 +1137,7 @@ def post_anomaly_interp_signals(
     For every signal column that has a matching ``<column>_anomaly`` mask,
     interpolates across anomaly-induced NaN runs up to a maximum gap size set
     to ``percentage_fill`` of one breath cycle. Non-anomaly NaNs (e.g. hard-
-    fault gaps that were already present or NaNs present in raw stage) 
+    fault gaps that were already present or NaNs present in raw stage)
     are preserved in the output.
 
     Parameters
@@ -1097,6 +1155,10 @@ def post_anomaly_interp_signals(
         Default 0.5 (50% of one cycle).
     breath_rate_hz : float, optional
         Expected breathing rate in Hz. Default 0.25 (15 breaths/min).
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column and
+        their matching ``{column}_anomaly`` masks) will be kept in the output.
+        Defaults to all non-time, non-mask columns.
 
     Returns
     -------
@@ -1114,6 +1176,7 @@ def post_anomaly_interp_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+        df = _select_data_columns(df, columns, file_path)
 
         data_columns = [
             c for c in df.columns
@@ -1551,6 +1614,7 @@ def impute_anomaly_signals(
     max_gap_cycles: int = 10,
     template_points: int = 200,
     template_cycles_use: int = 5,
+    columns: list[str] | None = None,
 ) -> None:
     """
     Cycle-synthesis imputation for NaN gaps caused by anomaly detection.
@@ -1583,6 +1647,11 @@ def impute_anomaly_signals(
         Points in the resampled cycle template (default 200).
     template_cycles_use : int, optional
         Clean cycles to use for the median template (default 5).
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column)
+        will be kept in the output; their matching ``{column}_anomaly`` masks
+        are used during imputation and then dropped. Defaults to all non-time,
+        non-mask columns.
 
     Returns
     -------
@@ -1613,6 +1682,7 @@ def impute_anomaly_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+        df = _select_data_columns(df, columns, file_path)
 
         data_columns = [
             c for c in df.columns
@@ -1708,6 +1778,7 @@ def gaussian_smooth_signals(
     out_path: str,
     sampling_rate: int,
     sigma_seconds: float = 0.05,
+    columns: list[str] | None = None,
 ) -> None:
     """
     Apply Gaussian smoothing to all signal columns in all CSV files.
@@ -1727,6 +1798,9 @@ def gaussian_smooth_signals(
         Sampling rate in Hz.
     sigma_seconds : float, optional
         Standard deviation of the Gaussian kernel in seconds. Default 0.05.
+    columns : list[str], optional
+        Column names to process. Only these columns (plus the time column)
+        will be kept in the output. Defaults to all non-time columns.
 
     Returns
     -------
@@ -1739,6 +1813,7 @@ def gaussian_smooth_signals(
 
     for file_path in mapped_files.values():
         df = pd.read_csv(file_path)
+        df = _select_data_columns(df, columns, file_path)
 
         for column in df.columns:
             if column.lower() != 'time':
@@ -1837,15 +1912,15 @@ def clean_signals(
     )
     micro_interp_signals(
         path_names['hard_fault'], path_names['micro_interp'],
-        sampling_rate,
+        sampling_rate, columns=columns,
     )
     detrend_signals(
         path_names['micro_interp'], path_names['detrend'],
-        sampling_rate, window_size_seconds=detrend_window_s,
+        sampling_rate, window_size_seconds=detrend_window_s, columns=columns,
     )
     bandpass_filter_signals(
         path_names['detrend'], path_names['bandpass'],
-        sampling_rate, passband=passband,
+        sampling_rate, passband=passband, columns=columns,
     )
 
     last = 'bandpass'
@@ -1860,15 +1935,15 @@ def clean_signals(
                 )
         detect_anomalies(
             path_names[last], path_names['anomaly'],
-            sampling_rate,
+            sampling_rate, columns=columns,
         )
         post_anomaly_interp_signals(
             path_names['anomaly'], path_names['post_anomaly_interp'],
-            sampling_rate,
+            sampling_rate, columns=columns,
         )
         impute_anomaly_signals(
             path_names['post_anomaly_interp'], path_names['impute_anomaly'],
-            sampling_rate,
+            sampling_rate, columns=columns,
         )
         last = 'impute_anomaly'
 
@@ -1881,5 +1956,5 @@ def clean_signals(
             )
         gaussian_smooth_signals(
             path_names[last], path_names['smooth'],
-            sampling_rate, sigma_seconds=sigma_seconds,
+            sampling_rate, sigma_seconds=sigma_seconds, columns=columns,
         )
