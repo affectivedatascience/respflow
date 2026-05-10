@@ -56,29 +56,32 @@ rf.make_sample_data(path_names)
 # Sampling rate
 sampling_rate = 2000
 
+# Columns containing data for preprocessing
+column_names = ['Respiration']
+
 # 1. Hard fault detection
-rf.hard_fault_signals(path_names['raw'], path_names['hard_fault'], sampling_rate, columns=['Respiration'])
+rf.hard_fault_signals(path_names['raw'], path_names['hard_fault'], sampling_rate, columns=column_names)
 
 # 2. Micro interpolation
-rf.micro_interp_signals(path_names['hard_fault'], path_names['micro_interp'], sampling_rate)
+rf.micro_interp_signals(path_names['hard_fault'], path_names['micro_interp'], sampling_rate, columns=column_names)
 
 # 3. Detrend
-rf.detrend_signals(path_names['micro_interp'], path_names['detrend'], sampling_rate, window_size_seconds=60)
+rf.detrend_signals(path_names['micro_interp'], path_names['detrend'], sampling_rate, window_size_seconds=60, columns=column_names)
 
 # 4. Bandpass filter
-rf.bandpass_filter_signals(path_names['detrend'], path_names['bandpass'], sampling_rate, passband='default', order=2)
+rf.bandpass_filter_signals(path_names['detrend'], path_names['bandpass'], sampling_rate, passband='default', order=2, columns=column_names)
 
 # 5. Anomaly detection
-rf.detect_anomalies(path_names['bandpass'], path_names['anomaly'], sampling_rate, merge_gap_seconds=1)
+rf.detect_anomalies(path_names['bandpass'], path_names['anomaly'], sampling_rate, merge_gap_seconds=1, columns=column_names)
 
 # 6. Post-anomaly interpolation
-rf.post_anomaly_interp_signals(path_names['anomaly'], path_names['post_anomaly_interp'], sampling_rate)
+rf.post_anomaly_interp_signals(path_names['anomaly'], path_names['post_anomaly_interp'], sampling_rate, columns=column_names)
 
 # 7. Cycle-synthesis imputation
-rf.impute_anomaly_signals(path_names['post_anomaly_interp'], path_names['impute_anomaly'], sampling_rate, blend_s=0.5)
+rf.impute_anomaly_signals(path_names['post_anomaly_interp'], path_names['impute_anomaly'], sampling_rate, blend_s=0.5, columns=column_names)
 
 # 8. Gaussian smoothing
-rf.gaussian_smooth_signals(path_names['impute_anomaly'], path_names['smooth'], sampling_rate, sigma_seconds=0.05)
+rf.gaussian_smooth_signals(path_names['impute_anomaly'], path_names['smooth'], sampling_rate, sigma_seconds=0.05, columns=column_names)
 
 # Plot data on the "Respiration" column
 rf.plot_dashboard(path_names, 'Respiration')
